@@ -1,0 +1,38 @@
+{
+    "enable_scheduled_push": {
+        "description": "启用定时推送",
+        "hint": "开启后插件会自动按设定时间推送大盘数据",
+        "type": "bool",
+        "default": false
+    },
+    "scheduled_push_times": {
+        "description": "定时推送时间点",
+        "hint": "24小时制，逗号分隔多个时间点，如 09:30,11:30,15:00",
+        "type": "string",
+        "default": "09:30,11:30,15:00"
+    },
+    "scheduled_push_groups": {
+        "description": "定时推送目标群组",
+        "hint": "群号列表，如 [\"12345678\"]",
+        "type": "list",
+        "default": []
+    },
+    "enable_llm_analysis": {
+        "description": "启用 LLM 智能分析",
+        "hint": "开启后推送内容会经过大模型分析再发送",
+        "type": "bool",
+        "default": false
+    },
+    "llm_provider_id": {
+        "description": "LLM 提供商 ID（用于大盘分析）",
+        "hint": "使用 /大盘提供商 命令查看可用列表。留空则自动检测",
+        "type": "string",
+        "default": ""
+    },
+    "llm_model": {
+        "description": "LLM 模型名（可选）",
+        "hint": "指定使用的模型名称，如 deepseek-chat、qwen3.5-plus。留空使用 provider 的默认模型",
+        "type": "string",
+        "default": ""
+    }
+}

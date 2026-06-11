@@ -67,7 +67,7 @@ MARKET_ANALYSIS_PROMPT = """你是一位专业的A股市场分析师。请基于
 class AStockMarketPlugin(Star):
     """A股大盘数据插件"""
 
-    def __init__(self, context: Context, config: AstrBotConfig = None):
+    def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
         self.config: AstrBotConfig = config if config is not None else {}
 
@@ -151,6 +151,19 @@ class AStockMarketPlugin(Star):
     # 定时推送调度
     # ------------------------------------------------------------------
 
+    def _parse_push_times(self) -> list[time]:
+        """Parse scheduled_push_times config into a list of time objects."""
+        push_times_str = self.config.get("scheduled_push_times", "09:30,11:30,15:00")
+        times: list[time] = []
+        for t in push_times_str.split(","):
+            t = t.strip()
+            try:
+                h, m = map(int, t.split(":"))
+                times.append(time(h, m))
+            except (ValueError, AttributeError):
+                logger.warning(f"跳过无效推送时间: {t}")
+        return times
+
     async def _delayed_start_scheduler(self):
         await asyncio.sleep(15)
         if self._push_task and not self._push_task.done():
@@ -174,7 +187,6 @@ class AStockMarketPlugin(Star):
                     await asyncio.sleep(max(wait, 60))
                     continue
 
-                push_times_str = self.config.get("scheduled_push_times", "09:30,11:30,15:00")
                 push_groups = self.config.get("scheduled_push_groups", [])
 
                 if not push_groups:
@@ -182,16 +194,7 @@ class AStockMarketPlugin(Star):
                     await asyncio.sleep(3600)
                     continue
 
-                # 解析多个推送时间
-                times = []
-                for t in push_times_str.split(","):
-                    t = t.strip()
-                    try:
-                        h, m = map(int, t.split(":"))
-                        times.append(time(h, m))
-                    except (ValueError, AttributeError):
-                        logger.warning(f"跳过无效推送时间: {t}")
-
+                times = self._parse_push_times()
                 if not times:
                     logger.warning("无有效推送时间，等待 1 小时")
                     await asyncio.sleep(3600)
@@ -225,20 +228,14 @@ class AStockMarketPlugin(Star):
                 await asyncio.sleep(300)
 
     def _next_weekday_morning(self) -> datetime:
-        """获取下一个周一（或今天如果是周一）的首次推送时间"""
-        push_times_str = self.config.get("scheduled_push_times", "09:30,11:30,15:00")
-        first_time_str = push_times_str.split(",")[0].strip()
-        try:
-            h, m = map(int, first_time_str.split(":"))
-        except (ValueError, AttributeError):
-            h, m = 9, 30
+        """Get the first configured push time on the next Monday."""
+        times = self._parse_push_times()
+        first = min(times, key=lambda x: (x.hour, x.minute)) if times else time(9, 30)
 
         now = datetime.now()
-        days_ahead = (7 - now.weekday()) % 7  # 到周一的天数
-        if days_ahead == 0:
-            days_ahead = 7  # 今天周日，推到下周一
-        target = now.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=days_ahead)
-        return target
+        # Saturday -> +2 days, Sunday -> +1 day
+        days_to_monday = (7 - now.weekday()) % 7 or 7
+        return datetime.combine(now.date() + timedelta(days=days_to_monday), first)
 
     async def _push_to_groups(self, group_list: list[str]):
         """向配置的群组推送大盘数据"""
@@ -342,10 +339,9 @@ class AStockMarketPlugin(Star):
             # 回退：旧版 provider.text_chat
             provider = self.context.get_using_provider()
             if provider:
-                if model_override:
-                    resp = await provider.text_chat(prompt=prompt, model=model_override)
-                else:
-                    resp = await provider.text_chat(prompt=prompt)
+                resp = await provider.text_chat(
+                    prompt=prompt, **({"model": model_override} if model_override else {})
+                )
                 if resp and getattr(resp, "completion_text", None):
                     return resp.completion_text.strip()
 
@@ -402,6 +398,7 @@ class AStockMarketPlugin(Star):
     @filter.command("大盘速报")
     async def cmd_market_quick(self, event: AstrMessageEvent):
         """快速获取大盘数据（不含分析）"""
+        self._learn_group_mapping(event)
         try:
             overview = await fetch_market_overview()
             if not overview.indices:

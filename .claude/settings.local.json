@@ -12,7 +12,10 @@
       "Read(//tmp/**)",
       "Bash(curl -sL \"https://hq.sinajs.cn/list=sh000300\" -e \"https://finance.sina.com.cn/\" -A \"Mozilla/5.0\")",
       "Bash(curl -s \"http://push2.eastmoney.com/api/qt/stock/get?secid=1.000300&fields=f57,f58,f43,f170\")",
-      "Bash(python3 -m json.tool)"
+      "Bash(python3 -m json.tool)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)"
     ]
   }
 }

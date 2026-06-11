@@ -2,6 +2,8 @@
 
 基于 AstrBot + NapCat 框架的 A 股大盘指数数据插件，支持实时行情查询、定时推送、LLM 智能分析。
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 ## 功能
 
 - **实时行情查询** — 上证指数、深证成指、创业板指、科创50、沪深300
@@ -99,3 +101,12 @@ astrbot_plugin_astock_market/
 4. **使用风险**：股市有风险，投资需谨慎。本插件开发者及 AstrBot 项目组不对因使用本插件而导致的任何直接或间接损失承担法律责任。
 
 5. **合规使用**：用户应遵守所在地法律法规，不得将本插件用于违法违规目的。本插件仅限个人学习研究使用。
+
+## 参考
+
+- [AstrBot 项目地址](https://github.com/AstrBotDevs/AstrBot)
+- [AstrBot 插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
+
+## 开源协议
+
+本项目基于 [GNU Affero General Public License v3](LICENSE) 发布。

@@ -1,0 +1,27 @@
+name: astrbot_plugin_astock_market
+display_name: A股大盘数据
+desc: A股大盘指数实时行情查询插件，支持上证指数、深证成指、创业板指、科创50、沪深300等五大指数的实时数据查询、定时推送及 LLM 智能分析。
+version: 1.0.0
+author: AceSalm0n
+repo: https://github.com/AceSalm0n/astrbot_plugin_astock_market
+homepage: https://github.com/AceSalm0n/astrbot_plugin_astock_market
+tags:
+  - a股
+  - 股票
+  - 大盘
+  - 行情
+  - 指数
+help:
+  /大盘 - 获取五大指数实时行情
+  /大盘分析 - 获取行情 + LLM 智能解读
+  /大盘速报 - 仅获取行情，不含 LLM
+  /大盘状态 - 查看插件推送配置状态
+  /大盘提供商 - 查看可用 LLM 提供商列表
+  /上证 - 查询上证指数
+  /深证 - 查询深证成指
+  /创业板 - 查询创业板指
+  /科创50 - 查询科创50
+  /沪深300 - 查询沪深300
+
+support_platforms:
+  - aiocqhttp

@@ -310,6 +310,25 @@ class AStockMarketPlugin(Star):
     # LLM 分析
     # ------------------------------------------------------------------
 
+    def _resolve_llm_provider_info(self) -> tuple[str, str]:
+        """Return configured LLM provider id and model for status display."""
+        provider_id = self.config.get("llm_provider_id", "") or ""
+        legacy_model = self.config.get("llm_model", "") or ""
+
+        if not provider_id:
+            return "自动检测", legacy_model or "（默认）"
+
+        model = legacy_model or "（默认）"
+        for provider in self.context.get_all_providers():
+            try:
+                meta = provider.meta()
+                if meta.id == provider_id:
+                    model = legacy_model or meta.model or "（未设置）"
+                    break
+            except Exception:
+                continue
+        return provider_id, model
+
     async def _generate_llm_analysis(self, overview: MarketOverview, umo: str = "") -> str:
         """调用 LLM 生成市场分析"""
         try:
@@ -319,6 +338,7 @@ class AStockMarketPlugin(Star):
                 market_data=market_text,
             )
 
+            # Legacy llm_model override; prefer model bound to the selected provider.
             model_override = self.config.get("llm_model", "") or None
             llm_kwargs = {}
             if model_override:
@@ -485,8 +505,7 @@ class AStockMarketPlugin(Star):
         times = self.config.get("scheduled_push_times", "09:30,11:30,15:00")
         groups = self.config.get("scheduled_push_groups", [])
         llm = self.config.get("enable_llm_analysis", False)
-        llm_provider = self.config.get("llm_provider_id", "") or "自动检测"
-        llm_model = self.config.get("llm_model", "") or "（默认）"
+        llm_provider, llm_model = self._resolve_llm_provider_info()
 
         text = (
             f"📊 A股大盘插件状态\n"
@@ -496,7 +515,8 @@ class AStockMarketPlugin(Star):
             f"LLM分析：{'✅ 已开启' if llm else '❌ 已关闭'}\n"
             f"LLM提供商：{llm_provider}\n"
             f"LLM模型：{llm_model}\n"
-            f"已学习群映射：{len(self._group_umo_map)} 个"
+            f"已学习群映射：{len(self._group_umo_map)} 个\n"
+            f"💡 可在 AstrBot 管理后台 → 插件配置中选择 LLM 提供商"
         )
         yield event.plain_result(text)
 
@@ -529,10 +549,9 @@ class AStockMarketPlugin(Star):
                     continue
 
             lines.append("💡 使用方式：")
-            lines.append('1. 复制上方的 "ID" 值')
-            lines.append("2. 在 AstrBot 管理后台 → 插件配置 → astrbot_plugin_astock_market")
-            lines.append('   将 ID 填入 "LLM 提供商 ID" 字段')
-            lines.append('3. （可选）如需指定模型，填入 "LLM 模型名" 字段')
+            lines.append("1. 推荐在 AstrBot 管理后台 → 插件配置 → astrbot_plugin_astock_market")
+            lines.append('   点击「LLM 提供商」旁的「选择提供商」直接挑选模型')
+            lines.append("2. 也可复制上方的 \"ID\" 值手动填入配置")
 
             yield event.plain_result("\n".join(lines))
         except Exception as e:

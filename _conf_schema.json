@@ -24,15 +24,17 @@
         "default": false
     },
     "llm_provider_id": {
-        "description": "LLM 提供商 ID（用于大盘分析）",
-        "hint": "使用 /大盘提供商 命令查看可用列表。留空则自动检测",
+        "description": "LLM 提供商（用于大盘分析）",
+        "hint": "点击「选择提供商」从已配置的对话模型列表中挑选（列表中会显示模型名）。留空则自动使用当前会话默认模型",
         "type": "string",
-        "default": ""
+        "default": "",
+        "_special": "select_provider"
     },
     "llm_model": {
-        "description": "LLM 模型名（可选）",
-        "hint": "指定使用的模型名称，如 deepseek-chat、qwen3.5-plus。留空使用 provider 的默认模型",
+        "description": "LLM 模型名（已废弃）",
+        "hint": "请通过上方「LLM 提供商」选择模型，此项仅保留旧配置兼容",
         "type": "string",
-        "default": ""
+        "default": "",
+        "invisible": true
     }
 }

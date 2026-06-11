@@ -18,8 +18,8 @@
 | `/大盘` | 获取五大指数实时行情 |
 | `/大盘分析` | 获取行情 + LLM 智能解读 |
 | `/大盘速报` | 仅获取行情，不含 LLM |
-| `/大盘状态` | 查看插件推送配置状态 |
-| `/大盘提供商` | 查看可用 LLM 提供商列表 |
+| `/大盘状态` | 查看插件推送配置状态（含 LLM 提供商和模型） |
+| `/大盘提供商` | 查看可用 LLM 提供商列表（也可在 WebUI 插件配置中直接选择） |
 | `/上证` | 查询上证指数（000001） |
 | `/深证` | 查询深证成指（399001） |
 | `/创业板` | 查询创业板指（399006） |
@@ -37,8 +37,8 @@ astrbot_plugin_astock_market:
   scheduled_push_groups:                 # 目标群组号列表
     - "123456789"
   enable_llm_analysis: false             # 推送时是否使用 LLM 分析
-  llm_provider_id: ""                    # 指定 LLM 提供商 ID（留空则自动检测）
-  llm_model: ""                          # 指定 LLM 模型名（留空则用 provider 默认模型）
+  llm_provider_id: ""                    # 在 WebUI 中点击「选择提供商」直接挑选（留空则自动检测）
+  llm_model: ""                          # （已废弃，通过上方提供商选择即可）
 ```
 
 ### 参数说明
@@ -49,8 +49,8 @@ astrbot_plugin_astock_market:
 | `scheduled_push_times` | string | `"09:30,11:30,15:00"` | 24 小时制，逗号分隔多个时间点 |
 | `scheduled_push_groups` | list | `[]` | 填写群号（纯数字），首次使用 `/大盘` 命令会自动学习群映射 |
 | `enable_llm_analysis` | bool | `false` | 开启后推送内容会经过 LLM 分析再发送 |
-| `llm_provider_id` | string | `""` | 指定 LLM 提供商 ID（如 `阿里云百炼_source/deepseek-v4-flash`），使用 `/大盘提供商` 查看可用列表。留空自动检测 |
-| `llm_model` | string | `""` | 指定使用的模型名称（如 `deepseek-chat`、`qwen3.5-plus`），留空则使用 provider 默认模型。仅在 `llm_provider_id` 不为空时生效 |
+| `llm_provider_id` | string | `""` | 在 AstrBot 管理后台插件配置页面点击「选择提供商」直接挑选模型列表中的某一项。留空自动检测 |
+| `llm_model` | string | `""` | ⚠️ **已废弃**，通过上方「LLM 提供商」选择时已自带模型信息。此处仅保留旧配置兼容 |
 
 ## 数据源
 
@@ -74,9 +74,11 @@ astrbot_plugin_astock_market:
 
 ```
 astrbot_plugin_astock_market/
-├── __init__.py       # 插件元数据（版本号、作者）
-├── main.py           # 插件主入口：命令处理、定时调度、LLM 集成
-└── market_api.py     # 数据获取层：东方财富 / 腾讯 / 新浪 API 封装
+├── __init__.py           # 插件元数据（版本号、作者）
+├── _conf_schema.json     # AstrBot WebUI 配置 schema（LLM 提供商下拉选择器等）
+├── metadata.yaml         # 插件注册信息（名称、帮助、支持平台）
+├── main.py               # 插件主入口：命令处理、定时调度、LLM 集成
+└── market_api.py         # 数据获取层：东方财富 / 腾讯 / 新浪 API 封装
 ```
 
 ## 依赖

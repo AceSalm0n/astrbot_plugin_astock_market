@@ -240,7 +240,7 @@ async def _fetch_from_tencent(code: str) -> Optional[IndexData]:
             high = _to_float(parts[33])     # 最高
             low = _to_float(parts[34])      # 最低
             volume = _to_float(parts[6])    # 成交量(手)
-            amount = _to_float(parts[37])   # 成交额(元)
+            amount = _to_float(parts[37]) * 10000  # 成交额(腾讯返回万元，转为元)
 
             change = price - pre_close if pre_close > 0 else 0
             change_pct = (change / pre_close * 100) if pre_close > 0 else 0
@@ -413,7 +413,8 @@ def format_market_overview_text(overview: MarketOverview, detail: bool = True) -
         return "\n".join(lines)
 
     # 全市场概况
-    total_amount = sum(i.amount for i in overview.indices if i.amount)
+    # 只对代表整体市场的上证(000001)和深证(399001)求和，避免子指数（创业板、科创50、沪深300）重复计算
+    total_amount = sum(i.amount for i in overview.indices if i.code in ("000001", "399001"))
     up = overview.up_count
     down = overview.down_count
     lines.extend([

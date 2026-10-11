@@ -6,56 +6,51 @@ AstrBot A 股大盘数据插件
 """
 
 import asyncio
+import base64
 import json
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Optional
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .card_renderer import render_market_card
 from .market_api import (
+    BEIJING_TZ,
     MarketOverview,
+    close_session,
     fetch_market_overview,
     fetch_single_index,
     format_market_overview_text,
-    close_session,
+    reset_market_state,
 )
+
+LLM_TIMEOUT = 30
+PUSH_GRACE_SECONDS = 60
 
 # ---------------------------------------------------------------------------
 # LLM 分析提示词
 # ---------------------------------------------------------------------------
 
-MARKET_ANALYSIS_PROMPT = """你是一位专业的A股市场分析师。请基于以下大盘数据，输出一份简洁的市场分析。
+MARKET_ANALYSIS_PROMPT = """请仅根据以下指数行情，输出不超过300字的客观解读。
 
-当前时间：{current_time}
+查询时间（北京时间）：{current_time}
 
 {market_data}
 
-请按以下格式输出分析：
-
-📊 **市场概况**
-[一句话总结今日市场整体表现]
-
-📈 **板块轮动观察**
-[基于各指数表现，分析资金可能的流向和板块轮动特征]
-
-💡 **市场情绪判断**
-[判断当前市场情绪：狂热/乐观/中性/谨慎/恐慌]
-
-⚠️ **风险提示**
-[列出需要注意的风险因素]
-
-📝 **综合观点**
-[一句话总结对当前市场的看法]
-
-注意：请保持分析的专业性和客观性，不构成投资建议。总字数控制在300字以内。"""
+请按“指数表现、指数间差异、数据局限”三个部分输出。
+事实必须能在所给数据中核对；推测必须标明为推测。
+这些数据不含行业板块、资金流向、新闻或全市场股票涨跌家数，请勿编造这些信息，
+也不要将监控指数的涨跌数量解释为股票涨跌家数。
+缺失数据不可视为零；行情时间未知不可称为实时行情。
+来源时间不一致、缺失指数或缓存情况必须如实说明。不构成投资建议。"""
 
 
 # ===========================================================================
 # 插件主类
 # ===========================================================================
+
 
 @register(
     "astrbot_plugin_astock_market",
@@ -67,13 +62,16 @@ MARKET_ANALYSIS_PROMPT = """你是一位专业的A股市场分析师。请基于
 class AStockMarketPlugin(Star):
     """A股大盘数据插件"""
 
-    def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config: AstrBotConfig = config if config is not None else {}
 
         # 定时推送任务句柄
-        self._push_task: Optional[asyncio.Task] = None
-        self._startup_task: Optional[asyncio.Task] = None
+        self._push_task: asyncio.Task | None = None
+        self._startup_task: asyncio.Task | None = None
+        self._last_push_slot: datetime | None = None
+        self._next_push_at: datetime | None = None
+        reset_market_state()
 
         # 群 unified_msg_origin 映射（动态学习）
         self._group_umo_map: dict[str, str] = {}
@@ -90,7 +88,10 @@ class AStockMarketPlugin(Star):
     # ------------------------------------------------------------------
 
     def _mapping_path(self) -> Path:
-        return StarTools.get_data_dir("astrbot_plugin_astock_market") / "group_mapping.json"
+        return (
+            StarTools.get_data_dir("astrbot_plugin_astock_market")
+            / "group_mapping.json"
+        )
 
     def _load_group_mapping(self):
         path = self._mapping_path()
@@ -154,15 +155,43 @@ class AStockMarketPlugin(Star):
     def _parse_push_times(self) -> list[time]:
         """Parse scheduled_push_times config into a list of time objects."""
         push_times_str = self.config.get("scheduled_push_times", "09:30,11:30,15:00")
-        times: list[time] = []
+        if not isinstance(push_times_str, str):
+            logger.warning("Invalid scheduled push times: expected a string")
+            return []
+        times: set[time] = set()
         for t in push_times_str.split(","):
             t = t.strip()
             try:
                 h, m = map(int, t.split(":"))
-                times.append(time(h, m))
+                times.add(time(h, m))
             except (ValueError, AttributeError):
-                logger.warning(f"跳过无效推送时间: {t}")
-        return times
+                logger.warning(f"Skipping invalid push time: {t}")
+        return sorted(times)
+
+    def _next_push_time(
+        self, now: datetime, times: list[time], closed_dates: set[date]
+    ) -> datetime | None:
+        """Find the next future slot on an eligible local date.
+
+        Args:
+            now: Current time, with an explicit time zone.
+            times: Sorted configured push times.
+            closed_dates: Additional manually maintained closed dates.
+
+        Returns:
+            The next Beijing-time slot, or None when no times are configured.
+        """
+        if not times:
+            return None
+        now = now.astimezone(BEIJING_TZ)
+        candidate_date = now.date()
+        while True:
+            if candidate_date.weekday() < 5 and candidate_date not in closed_dates:
+                for push_time in times:
+                    candidate = datetime.combine(candidate_date, push_time, BEIJING_TZ)
+                    if candidate > now:
+                        return candidate
+            candidate_date += timedelta(days=1)
 
     async def _delayed_start_scheduler(self):
         await asyncio.sleep(15)
@@ -176,101 +205,152 @@ class AStockMarketPlugin(Star):
         logger.info("A股大盘定时推送任务已启动")
 
     async def _scheduled_push_loop(self):
-        """定时推送主循环，支持多个推送时间点"""
+        """Keep a pending slot until it is handled, with bounded wake-up checks."""
+        schedule_key = None
         while True:
             try:
-                # 周末跳过，直接推到周一第一个推送时间
-                if datetime.now().weekday() >= 5:
-                    next_monday = self._next_weekday_morning()
-                    wait = (next_monday - datetime.now()).total_seconds()
-                    logger.info(f"周末跳过推送，下次推送: {next_monday.strftime('%Y-%m-%d %H:%M')}")
-                    await asyncio.sleep(max(wait, 60))
-                    continue
-
+                now = datetime.now(BEIJING_TZ)
+                enabled = self.config.get("enable_scheduled_push", False)
                 push_groups = self.config.get("scheduled_push_groups", [])
-
-                if not push_groups:
-                    logger.warning("未配置推送群组，等待 1 小时后重试")
-                    await asyncio.sleep(3600)
-                    continue
-
                 times = self._parse_push_times()
-                if not times:
-                    logger.warning("无有效推送时间，等待 1 小时")
-                    await asyncio.sleep(3600)
+                closed_dates: set[date] = set()
+                raw_dates = self.config.get("market_closed_dates", [])
+                if not isinstance(raw_dates, list):
+                    logger.warning("Invalid market_closed_dates: expected a list")
+                    raw_dates = []
+                for raw_date in raw_dates:
+                    try:
+                        closed_dates.add(date.fromisoformat(raw_date))
+                    except (ValueError, TypeError):
+                        logger.warning(f"Skipping invalid closed date: {raw_date}")
+                if (
+                    not enabled
+                    or not isinstance(push_groups, list)
+                    or not push_groups
+                    or not times
+                ):
+                    self._next_push_at = None
+                    schedule_key = None
+                    await asyncio.sleep(60)
                     continue
-
-                now = datetime.now()
-                now_t = now.time()
-
-                # 找到下一个推送时间点
-                next_push = None
-                for t in sorted(times, key=lambda x: (x.hour, x.minute)):
-                    if t > now_t:
-                        next_push = datetime.combine(now.date(), t)
-                        break
-
-                # 如果今天的所有时间都已过，推到明天第一个
-                if next_push is None:
-                    t0 = min(times, key=lambda x: (x.hour, x.minute))
-                    next_push = datetime.combine(now.date() + timedelta(days=1), t0)
-
-                wait = (next_push - now).total_seconds()
-                logger.info(f"下次大盘推送: {next_push.strftime('%Y-%m-%d %H:%M')}")
-                await asyncio.sleep(wait)
-
-                await self._push_to_groups(push_groups)
-
+                current_key = (tuple(times), frozenset(closed_dates))
+                if current_key != schedule_key:
+                    pending = self._next_push_at
+                    if (
+                        pending is None
+                        or pending > now
+                        or pending.time() not in times
+                        or pending.date().weekday() >= 5
+                        or pending.date() in closed_dates
+                    ):
+                        self._next_push_at = None
+                    schedule_key = current_key
+                if self._next_push_at is None:
+                    self._next_push_at = self._next_push_time(now, times, closed_dates)
+                    logger.info(f"Next market push: {self._next_push_at}")
+                target = self._next_push_at
+                delay = (target - now).total_seconds()
+                if delay > 0:
+                    await asyncio.sleep(min(delay, 60))
+                    continue
+                self._next_push_at = None
+                if (
+                    now.date() != target.date()
+                    or now.weekday() >= 5
+                    or now.date() in closed_dates
+                    or -delay > PUSH_GRACE_SECONDS
+                    or (
+                        self._last_push_slot is not None
+                        and target <= self._last_push_slot
+                    )
+                ):
+                    logger.warning(
+                        f"Skipping expired or ineligible push slot: {target}"
+                    )
+                    continue
+                # Mark the slot before sending; failures must not resend the batch.
+                self._last_push_slot = target
+                await self._push_to_groups(list(push_groups))
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"定时推送异常: {e}", exc_info=True)
-                await asyncio.sleep(300)
-
-    def _next_weekday_morning(self) -> datetime:
-        """Get the first configured push time on the next Monday."""
-        times = self._parse_push_times()
-        first = min(times, key=lambda x: (x.hour, x.minute)) if times else time(9, 30)
-
-        now = datetime.now()
-        # Saturday -> +2 days, Sunday -> +1 day
-        days_to_monday = (7 - now.weekday()) % 7 or 7
-        return datetime.combine(now.date() + timedelta(days=days_to_monday), first)
+                logger.error(f"Scheduled push failed: {e}", exc_info=True)
+                await asyncio.sleep(60)
 
     async def _push_to_groups(self, group_list: list[str]):
-        """向配置的群组推送大盘数据"""
+        """Fetch fresh market data once and send it to the configured groups.
+
+        Args:
+            group_list: Group IDs eligible for this scheduled push.
+        """
         try:
-            overview = await fetch_market_overview()
-            # 根据配置决定是否使用 LLM 分析
-            if self.config.get("enable_llm_analysis", False):
-                text = await self._generate_llm_analysis(overview)
-            else:
-                text = format_market_overview_text(overview)
+            overview = await fetch_market_overview(force_refresh=True)
+            if not overview.indices:
+                logger.warning("Skipping scheduled push: no valid market data")
+                return
+            image, text, fallback = await self._prepare_market_output(
+                overview, analyze=self.config.get("enable_llm_analysis", False)
+            )
 
             success = 0
             for group_id in group_list:
                 try:
                     clean_id = self._extract_group_id(group_id)
-                    ok = await self._send_group_text(clean_id, text)
+                    ok = (
+                        await self._send_group_text(clean_id, text, image)
+                        if image is not None
+                        else await self._send_group_text(clean_id, text)
+                    )
+                    umo = self._group_umo_map.get(clean_id)
+                    if not ok and umo:
+                        try:
+                            ok = bool(
+                                await self.context.send_message(
+                                    umo, self._make_chain(text, image)
+                                )
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Mapped market send failed [{clean_id}]: {e}"
+                            )
+                    # Only retry the failed group's payload, never the whole batch.
+                    if not ok and image is not None:
+                        logger.warning(f"Falling back to market text [{clean_id}]")
+                        ok = await self._send_group_text(clean_id, fallback)
+                        if not ok and umo:
+                            ok = bool(
+                                await self.context.send_message(
+                                    umo, self._make_chain(fallback)
+                                )
+                            )
                     if ok:
                         success += 1
-                    else:
-                        # 回退：使用已学习的映射
-                        umo = self._group_umo_map.get(clean_id)
-                        if umo:
-                            await self.context.send_message(
-                                umo, self._make_chain(text)
-                            )
-                            success += 1
                 except Exception as e:
-                    logger.error(f"推送群组 {group_id} 失败: {e}")
+                    logger.error(f"Market push failed [{group_id}]: {e}")
 
-            logger.info(f"大盘推送完成: 成功 {success}/{len(group_list)}")
+            logger.info(f"Market push complete: success {success}/{len(group_list)}")
         except Exception as e:
-            logger.error(f"大盘推送数据获取失败: {e}")
+            logger.error(f"Market push preparation failed: {e}")
 
-    async def _send_group_text(self, group_id: str, text: str) -> bool:
-        """通过 OneBot API 发送文本消息到群"""
+    async def _send_group_text(
+        self, group_id: str, text: str, image: bytes | None = None
+    ) -> bool:
+        """Send a market payload through the existing OneBot clients.
+
+        Args:
+            group_id: Numeric group ID.
+            text: Market text or an optional interpretation following the image.
+            image: In-memory PNG, or None for a text-only payload.
+
+        Returns:
+            True if a OneBot call completed without an exception.
+        """
+        message = []
+        if image is not None:
+            encoded = base64.b64encode(image).decode("ascii")
+            message.append({"type": "image", "data": {"file": "base64://" + encoded}})
+        if text:
+            message.append({"type": "text", "data": {"text": text}})
         platforms = getattr(self.context, "platform_manager", None)
         if not platforms:
             return False
@@ -284,27 +364,75 @@ class AStockMarketPlugin(Star):
                 )
                 if not client:
                     continue
-                call = (
-                    getattr(client, "call_action", None)
-                    or (
-                        hasattr(client, "api")
-                        and getattr(client.api, "call_action", None)
-                    )
+                call = getattr(client, "call_action", None) or (
+                    hasattr(client, "api") and getattr(client.api, "call_action", None)
                 )
                 if call:
                     await call(
                         "send_group_msg",
                         group_id=int(group_id),
-                        message=[{"type": "text", "data": {"text": text}}],
+                        message=message,
                     )
                     return True
-            except Exception:
+            except Exception as e:
+                logger.warning(f"OneBot market send failed [{group_id}]: {e}")
                 continue
         return False
 
-    def _make_chain(self, text: str):
-        """构造 MessageChain 对象"""
-        return MessageChain().message(text)
+    def _make_chain(self, text: str, image: bytes | None = None):
+        """Build a fresh chain with an image before its interpretation.
+
+        Args:
+            text: Text to append, if nonempty.
+            image: In-memory PNG, or None for a text-only chain.
+
+        Returns:
+            An independent AstrBot message chain.
+        """
+        chain = MessageChain()
+        if image is not None:
+            from astrbot.api.message_components import Image
+
+            chain.chain.append(Image.fromBytes(image))
+        if text:
+            chain.message(text)
+        return chain
+
+    async def _prepare_market_output(
+        self, overview: MarketOverview, umo: str = "", *, analyze: bool = False
+    ) -> tuple[bytes | None, str, str]:
+        """Prepare one payload and its full-text fallback for all recipients.
+
+        Args:
+            overview: Validated market data from the unchanged fetch layer.
+            umo: Session origin used for model selection.
+            analyze: Whether to request one bounded interpretation.
+
+        Returns:
+            PNG or None, primary text, and complete text for a send fallback.
+        """
+        image = None
+        if self.config.get("enable_image_output", False):
+            try:
+                image = await asyncio.to_thread(render_market_card, overview)
+                if not isinstance(image, bytes) or not image:
+                    raise ValueError("Renderer returned no PNG bytes")
+            except Exception as e:
+                logger.warning(f"Market card unavailable; using text: {e}")
+                image = None
+        if analyze:
+            text = await self._generate_llm_analysis(
+                overview, umo, include_market=image is None
+            )
+            fallback = (
+                format_market_overview_text(overview) + "\n\n" + text
+                if image is not None
+                else text
+            )
+        else:
+            fallback = format_market_overview_text(overview)
+            text = "" if image is not None else fallback
+        return image, text, fallback
 
     # ------------------------------------------------------------------
     # LLM 分析
@@ -329,49 +457,89 @@ class AStockMarketPlugin(Star):
                 continue
         return provider_id, model
 
-    async def _generate_llm_analysis(self, overview: MarketOverview, umo: str = "") -> str:
-        """调用 LLM 生成市场分析"""
-        try:
-            market_text = format_market_overview_text(overview, detail=True)
-            prompt = MARKET_ANALYSIS_PROMPT.format(
-                current_time=overview.fetch_time.strftime("%Y-%m-%d %H:%M"),
-                market_data=market_text,
-            )
+    async def _generate_llm_analysis(
+        self, overview: MarketOverview, umo: str = "", *, include_market: bool = True
+    ) -> str:
+        """Interpret full source data and optionally include it in the response.
 
-            # Legacy llm_model override; prefer model bound to the selected provider.
+        Args:
+            overview: Validated index data and its response time.
+            umo: Session origin, or an empty string for a scheduled push.
+            include_market: Include original market text in the returned response.
+
+        Returns:
+            Analysis or a fallback explanation, optionally preceded by market text.
+        """
+        market_text = format_market_overview_text(overview, detail=True)
+        prefix = market_text + "\n\n" if include_market else ""
+        if not overview.indices:
+            return prefix + "（暂无有效行情，已跳过分析）"
+        today = datetime.now(BEIJING_TZ).date()
+        if any(
+            idx.quote_time is not None
+            and idx.quote_time.astimezone(BEIJING_TZ).date() < today
+            for idx in overview.indices
+        ):
+            return prefix + "（包含历史行情，已跳过当日分析）"
+        prompt = MARKET_ANALYSIS_PROMPT.format(
+            current_time=overview.fetch_time.strftime("%Y-%m-%d %H:%M"),
+            market_data=market_text,
+        )
+
+        async def request_analysis() -> str:
+            """Resolve the selected provider and request a single interpretation."""
+            configured = self.config.get("llm_provider_id", "") or ""
             model_override = self.config.get("llm_model", "") or None
-            llm_kwargs = {}
-            if model_override:
-                llm_kwargs["model"] = model_override
-
-            # 优先使用配置的提供商，否则自动检测
-            configured_provider = self.config.get("llm_provider_id", "")
-            provider_id = configured_provider or await self.context.get_current_chat_provider_id(umo)
-            if provider_id:
-                resp = await self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=prompt,
-                    **llm_kwargs,
+            kwargs = {"model": model_override} if model_override else {}
+            generate = getattr(self.context, "llm_generate", None)
+            provider_id = configured
+            provider = None
+            if not configured:
+                resolve = getattr(self.context, "get_current_chat_provider_id", None)
+                if umo and callable(resolve) and callable(generate):
+                    provider_id = await resolve(umo)
+                else:
+                    get_async = getattr(self.context, "get_using_provider_async", None)
+                    if callable(get_async):
+                        provider = await get_async(umo=umo or None)
+                    else:
+                        get_provider = getattr(self.context, "get_using_provider", None)
+                        if callable(get_provider):
+                            provider = get_provider(umo) if umo else get_provider()
+                    if provider and callable(generate):
+                        provider_id = provider.meta().id
+            if provider_id and callable(generate):
+                response = await generate(
+                    chat_provider_id=provider_id, prompt=prompt, **kwargs
                 )
-                if resp and getattr(resp, "completion_text", None):
-                    return resp.completion_text.strip()
+            else:
+                if configured:
+                    # Legacy SDK lookup must still honor the explicit selection.
+                    for item in self.context.get_all_providers():
+                        if item.meta().id == configured:
+                            provider = item
+                            break
+                if provider is None:
+                    return ""
+                response = await provider.text_chat(prompt=prompt, **kwargs)
+            completion = getattr(response, "completion_text", None)
+            return completion.strip() if isinstance(completion, str) else ""
 
-            # 回退：旧版 provider.text_chat
-            provider = self.context.get_using_provider()
-            if provider:
-                resp = await provider.text_chat(
-                    prompt=prompt, **({"model": model_override} if model_override else {})
-                )
-                if resp and getattr(resp, "completion_text", None):
-                    return resp.completion_text.strip()
-
-            # LLM 不可用时输出原始数据
-            logger.warning("LLM 分析不可用，输出原始数据")
-            return market_text + "\n\n（由于 LLM 暂不可用，以上为原始数据）"
+        try:
+            analysis = await asyncio.wait_for(request_analysis(), timeout=LLM_TIMEOUT)
+            if analysis:
+                if len(analysis) > 300:
+                    analysis = analysis[:299] + "…"
+                return prefix + "🤖 指数解读\n" + analysis
+            logger.warning("LLM returned no usable analysis")
         except Exception as e:
-            logger.warning(f"LLM 分析失败: {e}")
-            text = format_market_overview_text(overview, detail=True)
-            return text + f"\n\n（LLM 分析暂不可用）"
+            logger.warning(f"LLM analysis unavailable: {e}")
+        explanation = (
+            "（LLM 分析暂不可用，以上为原始行情）"
+            if include_market
+            else "（LLM 分析暂不可用）"
+        )
+        return prefix + explanation
 
     # ------------------------------------------------------------------
     # 命令处理器
@@ -379,7 +547,7 @@ class AStockMarketPlugin(Star):
 
     @filter.command("大盘")
     async def cmd_market_overview(self, event: AstrMessageEvent):
-        """获取大盘数据，并使用 LLM 分析"""
+        """Fetch and return the market overview without model analysis."""
         self._learn_group_mapping(event)
 
         yield event.plain_result("正在获取大盘数据...")
@@ -390,8 +558,16 @@ class AStockMarketPlugin(Star):
                 yield event.plain_result("获取大盘数据失败，请稍后重试")
                 return
 
-            text = format_market_overview_text(overview)
-            yield event.plain_result(text)
+            image, text, fallback = await self._prepare_market_output(overview)
+            if image is not None:
+                try:
+                    result = event.chain_result(self._make_chain(text, image).chain)
+                except Exception as e:
+                    logger.warning(f"Market image result unavailable; using text: {e}")
+                    result = event.plain_result(fallback)
+            else:
+                result = event.plain_result(text)
+            yield result
         except Exception as e:
             logger.error(f"获取大盘数据异常: {e}", exc_info=True)
             yield event.plain_result(f"获取大盘数据失败: {str(e)}")
@@ -409,8 +585,18 @@ class AStockMarketPlugin(Star):
                 yield event.plain_result("获取大盘数据失败，请稍后重试")
                 return
 
-            analysis = await self._generate_llm_analysis(overview, event.unified_msg_origin)
-            yield event.plain_result(analysis)
+            image, text, fallback = await self._prepare_market_output(
+                overview, event.unified_msg_origin, analyze=True
+            )
+            if image is not None:
+                try:
+                    result = event.chain_result(self._make_chain(text, image).chain)
+                except Exception as e:
+                    logger.warning(f"Market image result unavailable; using text: {e}")
+                    result = event.plain_result(fallback)
+            else:
+                result = event.plain_result(text)
+            yield result
         except Exception as e:
             logger.error(f"大盘分析异常: {e}", exc_info=True)
             yield event.plain_result(f"分析失败: {str(e)}")
@@ -424,8 +610,16 @@ class AStockMarketPlugin(Star):
             if not overview.indices:
                 yield event.plain_result("获取大盘数据失败，请稍后重试")
                 return
-            text = format_market_overview_text(overview, detail=True)
-            yield event.plain_result(text)
+            image, text, fallback = await self._prepare_market_output(overview)
+            if image is not None:
+                try:
+                    result = event.chain_result(self._make_chain(text, image).chain)
+                except Exception as e:
+                    logger.warning(f"Market image result unavailable; using text: {e}")
+                    result = event.plain_result(fallback)
+            else:
+                result = event.plain_result(text)
+            yield result
         except Exception as e:
             logger.error(f"大盘速报异常: {e}", exc_info=True)
             yield event.plain_result(f"获取失败: {str(e)}")
@@ -475,23 +669,25 @@ class AStockMarketPlugin(Star):
         else:
             yield event.plain_result(result)
 
-    async def _query_index(self, code: str) -> Optional[str]:
-        """查询单只指数，返回格式化文本"""
+    async def _query_index(self, code: str) -> str | None:
+        """Return a single index with the shared missing-data formatting.
+
+        Args:
+            code: Supported index code.
+
+        Returns:
+            Formatted index data, or None when every source failed.
+        """
         try:
             data = await fetch_single_index(code)
             if data is None:
                 return None
-            return (
-                f"{data.change_symbol} {data.name}（{data.code}）\n"
-                f"点位：{data.latest_price:.2f}\n"
-                f"涨跌额：{data.change:+.2f}\n"
-                f"涨幅：{data.change_pct:+.2f}%\n"
-                f"最高：{data.high_price:.2f}  最低：{data.low_price:.2f}\n"
-                f"昨收：{data.pre_close:.2f}  开盘：{data.open_price:.2f}\n"
-                f"成交额：{data.amount / 1e8:.2f}亿"
+            return format_market_overview_text(
+                MarketOverview([data], datetime.now(BEIJING_TZ), data.source),
+                detail=False,
             )
         except Exception as e:
-            logger.error(f"查询指数[{code}]异常: {e}")
+            logger.error(f"Index query failed [{code}]: {e}")
             return None
 
     # ------------------------------------------------------------------
@@ -505,13 +701,23 @@ class AStockMarketPlugin(Star):
         times = self.config.get("scheduled_push_times", "09:30,11:30,15:00")
         groups = self.config.get("scheduled_push_groups", [])
         llm = self.config.get("enable_llm_analysis", False)
+        image = self.config.get("enable_image_output", False)
         llm_provider, llm_model = self._resolve_llm_provider_info()
+        closed_dates = self.config.get("market_closed_dates", [])
+        calendar_status = (
+            f"周末及手动休市日期（{len(closed_dates)} 条，请按年度维护）"
+            if isinstance(closed_dates, list) and closed_dates
+            else "仅过滤周末（未配置休市日期）"
+        )
 
         text = (
             f"📊 A股大盘插件状态\n"
             f"定时推送：{'✅ 已开启' if enabled else '❌ 已关闭'}\n"
             f"推送时间：{times}\n"
+            f"时区：北京时间 UTC+8\n"
+            f"休市过滤：{calendar_status}\n"
             f"推送群组：{len(groups)} 个\n"
+            f"图片输出配置：{'已开启（失败时尝试文字回退）' if image else '已关闭（文字输出）'}\n"
             f"LLM分析：{'✅ 已开启' if llm else '❌ 已关闭'}\n"
             f"LLM提供商：{llm_provider}\n"
             f"LLM模型：{llm_model}\n"
@@ -549,9 +755,11 @@ class AStockMarketPlugin(Star):
                     continue
 
             lines.append("💡 使用方式：")
-            lines.append("1. 推荐在 AstrBot 管理后台 → 插件配置 → astrbot_plugin_astock_market")
-            lines.append('   点击「LLM 提供商」旁的「选择提供商」直接挑选模型')
-            lines.append("2. 也可复制上方的 \"ID\" 值手动填入配置")
+            lines.append(
+                "1. 推荐在 AstrBot 管理后台 → 插件配置 → astrbot_plugin_astock_market"
+            )
+            lines.append("   点击「LLM 提供商」旁的「选择提供商」直接挑选模型")
+            lines.append('2. 也可复制上方的 "ID" 值手动填入配置')
 
             yield event.plain_result("\n".join(lines))
         except Exception as e:

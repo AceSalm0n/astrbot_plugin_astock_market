@@ -17,6 +17,18 @@
         "type": "list",
         "default": []
     },
+    "market_closed_dates": {
+        "description": "额外休市日期（手动维护）",
+        "hint": "YYYY-MM-DD 日期列表，请按交易所年度休市公告维护。周六、周日固定跳过；留空仅过滤周末，不代表完整交易日历",
+        "type": "list",
+        "default": []
+    },
+    "enable_image_output": {
+        "description": "启用本地行情卡片",
+        "hint": "默认关闭。开启后大盘、速报、分析和定时推送使用 Pillow 图片；字体、依赖或绘图失败时回退完整文字",
+        "type": "bool",
+        "default": false
+    },
     "enable_llm_analysis": {
         "description": "启用 LLM 智能分析",
         "hint": "开启后推送内容会经过大模型分析再发送",

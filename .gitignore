@@ -1,3 +1,5 @@
 # Claude Code 本地配置
 .claude/
 __pycache__/
+.idea/
+AGENTS.md

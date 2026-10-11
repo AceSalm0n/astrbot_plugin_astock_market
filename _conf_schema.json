@@ -24,10 +24,19 @@
         "default": []
     },
     "enable_image_output": {
-        "description": "启用本地行情卡片",
-        "hint": "默认关闭。开启后大盘、速报、分析和定时推送使用 Pillow 图片；字体、依赖或绘图失败时回退完整文字",
+        "description": "行情输出方式",
+        "hint": "选择文字或图片，默认文字。适用于大盘、速报、分析和定时推送；图片依赖、字体或绘图失败时回退完整文字",
         "type": "bool",
-        "default": false
+        "default": false,
+        "options": [false, true],
+        "labels": ["文字", "图片"]
+    },
+    "card_background": {
+        "description": "卡片背景图片",
+        "hint": "仅图片模式生效。上传后保存配置；只使用列表第一张，建议仅保留一张。支持静态 JPG/PNG/WebP，插件只处理不超过 10 MiB、2000 万像素的图片。背景上显示液态玻璃风格数据框；留空或图片异常时使用默认浅色背景",
+        "type": "file",
+        "default": [],
+        "file_types": ["jpg", "jpeg", "png", "webp"]
     },
     "enable_llm_analysis": {
         "description": "启用 LLM 智能分析",

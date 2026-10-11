@@ -1,7 +1,10 @@
 """Render a fixed five-index overview as an in-memory PNG card."""
 
+import warnings
 from io import BytesIO
 from pathlib import Path
+
+from astrbot.api import logger
 
 from .market_api import BEIJING_TZ, MarketOverview
 
@@ -29,11 +32,15 @@ _FONT_CANDIDATES = (
 )
 
 
-def render_market_card(overview: MarketOverview) -> bytes:
+def render_market_card(
+    overview: MarketOverview, *, background_path: Path | None = None
+) -> bytes:
     """Render quotes with explicit missing rows and provenance.
 
     Args:
         overview: Existing market snapshot; its response clock anchors quote age.
+        background_path: Validated uploaded image path, or None for the light card.
+            Invalid images are ignored without discarding the market card.
 
     Returns:
         PNG bytes without writing runtime files.
@@ -42,7 +49,7 @@ def render_market_card(overview: MarketOverview) -> bytes:
         ImportError: Pillow is unavailable.
         RuntimeError: No supported Chinese font can be loaded.
     """
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
     fonts = {}
     for candidate in _FONT_CANDIDATES:
@@ -181,9 +188,36 @@ def render_market_card(overview: MarketOverview) -> bytes:
         )
     sections.append(footer)
 
+    background = None
+    if background_path is not None:
+        try:
+            # Bound the actual read rather than trusting a prior file size check.
+            with background_path.open("rb") as source:
+                encoded = source.read(10 * 1024 * 1024 + 1)
+            if len(encoded) > 10 * 1024 * 1024:
+                raise ValueError("Background exceeds the 10 MiB limit")
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(BytesIO(encoded)) as source:
+                    if source.format not in {"JPEG", "PNG", "WEBP"}:
+                        raise ValueError("Unsupported background image format")
+                    if source.width * source.height > 20_000_000:
+                        raise ValueError(
+                            "Background exceeds the 20 million pixel limit"
+                        )
+                    if getattr(source, "n_frames", 1) != 1:
+                        raise ValueError("Animated backgrounds are unsupported")
+                    background = ImageOps.exif_transpose(source).convert("RGBA")
+        except Exception as error:
+            logger.warning(
+                "Card background unavailable; using the default background (%s)",
+                type(error).__name__,
+            )
+
     # Measure every line before allocating the final canvas. Long metadata is
     # character-wrapped to work for both CJK text and unbroken provider names.
-    width, padding, inset = 1000, 30, 22
+    width = 1000
+    padding, inset, gap = (40, 24, 22) if background is not None else (30, 22, 16)
     text_width = width - 2 * (padding + inset)
     layouts = []
     y = padding
@@ -234,15 +268,101 @@ def render_market_card(overview: MarketOverview) -> bytes:
                 y += 4
         y += inset - 4
         layouts.append((top, y, runs))
-        y += 16
-    image = Image.new("RGB", (width, y + padding - 16), (239, 244, 249))
+        y += gap
+    image = Image.new("RGB", (width, y + padding - gap + 50), (239, 244, 249))
+    if background is not None:
+        background = ImageOps.fit(
+            background, image.size, method=Image.Resampling.LANCZOS
+        )
+        image = Image.alpha_composite(image.convert("RGBA"), background)
+        frosted = image.filter(ImageFilter.GaussianBlur(12))
+        shadow = Image.new("RGBA", image.size)
+        shadow_draw = ImageDraw.Draw(shadow)
+        for top, bottom, _ in layouts:
+            shadow_draw.rounded_rectangle(
+                (padding + 2, top + 8, width - padding + 2, bottom + 8),
+                radius=26,
+                fill=(9, 19, 38, 70),
+            )
+        image = Image.alpha_composite(
+            image, shadow.filter(ImageFilter.GaussianBlur(12))
+        )
     draw = ImageDraw.Draw(image)
     for top, bottom, runs in layouts:
-        draw.rounded_rectangle(
-            (padding, top, width - padding, bottom), radius=18, fill=(255, 255, 255)
-        )
+        if background is None:
+            draw.rounded_rectangle(
+                (padding, top, width - padding, bottom), radius=18, fill=(255, 255, 255)
+            )
+        else:
+            panel_width, panel_height = width - 2 * padding, bottom - top
+            # Magnify the blurred backdrop slightly to suggest glass refraction.
+            panel = frosted.crop((padding, top, width - padding, bottom))
+            enlarged = panel.resize(
+                (int(panel_width * 1.035), int(panel_height * 1.035)),
+                Image.Resampling.BICUBIC,
+            )
+            offset_x = (enlarged.width - panel_width) // 2
+            offset_y = (enlarged.height - panel_height) // 2
+            panel = enlarged.crop(
+                (offset_x, offset_y, offset_x + panel_width, offset_y + panel_height)
+            )
+            sheen = Image.new("RGBA", panel.size)
+            sheen_draw = ImageDraw.Draw(sheen)
+            for row in range(panel_height):
+                position = row / max(panel_height - 1, 1)
+                alpha = int(170 - 35 * min(position * 3, 1) + 12 * position)
+                sheen_draw.line((0, row, panel_width, row), fill=(255, 255, 255, alpha))
+            panel = Image.alpha_composite(panel, sheen)
+            rim = ImageDraw.Draw(panel)
+            rim.rounded_rectangle(
+                (0, 0, panel_width - 1, panel_height - 1),
+                radius=24,
+                outline=(255, 255, 255, 220),
+                width=2,
+            )
+            rim.arc((2, 2, 50, 50), 180, 270, fill=(255, 255, 255, 255), width=2)
+            mask = Image.new("L", panel.size)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (0, 0, panel_width - 1, panel_height - 1), radius=24, fill=255
+            )
+            image.paste(panel, (padding, top), mask)
         for text_x, text_y, text, font, color in runs:
+            if background is not None:
+                color = {
+                    _INK: (18, 29, 43),
+                    _NEUTRAL: (35, 45, 58),
+                    _MUTED: (27, 38, 51),
+                    _UP: (141, 16, 35),
+                    _DOWN: (0, 70, 42),
+                }.get(color, color)
             draw.text((text_x, text_y), text, font=font, fill=color, anchor="lt")
+
+    # Reserve a separate footer so the repository credit never covers market data.
+    repository = "astrbot_plugin_astock_market"
+    credit_font = fonts[22]
+    credit_width = int(credit_font.getlength(repository) + 0.999)
+    with Image.open(Path(__file__).parent / "assets" / "github-mark.png") as source:
+        icon = source.convert("RGBA")
+    icon.thumbnail((26, 26), Image.Resampling.LANCZOS)
+    badge_width = credit_width + icon.width + 10 + 28
+    badge_left = width - padding - badge_width
+    badge_top = image.height - 52
+    credit = Image.new("RGBA", image.size)
+    credit_draw = ImageDraw.Draw(credit)
+    credit_draw.rounded_rectangle(
+        (badge_left, badge_top, width - padding, image.height - 14),
+        radius=14,
+        fill=(255, 255, 255, 235),
+    )
+    credit.paste(icon, (badge_left + 14, badge_top + (38 - icon.height) // 2), icon)
+    credit_draw.text(
+        (badge_left + 14 + icon.width + 10, badge_top + 8),
+        repository,
+        font=credit_font,
+        fill=_INK,
+        anchor="lt",
+    )
+    image = Image.alpha_composite(image.convert("RGBA"), credit).convert("RGB")
     output = BytesIO()
     image.save(output, format="PNG")
     return output.getvalue()

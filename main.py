@@ -414,7 +414,39 @@ class AStockMarketPlugin(Star):
         image = None
         if self.config.get("enable_image_output", False):
             try:
-                image = await asyncio.to_thread(render_market_card, overview)
+                render_kwargs = {}
+                backgrounds = self.config.get("card_background", [])
+                if backgrounds:
+                    try:
+                        if not isinstance(backgrounds, list) or not isinstance(
+                            backgrounds[0], str
+                        ):
+                            raise ValueError(
+                                "Background configuration must be a file list"
+                            )
+                        relative = Path(backgrounds[0])
+                        if (
+                            relative.is_absolute()
+                            or ".." in relative.parts
+                            or relative.parts[:-1] != ("files", "card_background")
+                            or relative.suffix.lower()
+                            not in {".jpg", ".jpeg", ".png", ".webp"}
+                        ):
+                            raise ValueError("Invalid uploaded background path")
+                        data_root = StarTools.get_data_dir(
+                            "astrbot_plugin_astock_market"
+                        ).resolve()
+                        uploaded = (data_root / relative).resolve()
+                        uploaded.relative_to(data_root / "files" / "card_background")
+                        render_kwargs["background_path"] = uploaded
+                    except Exception as error:
+                        logger.warning(
+                            "Ignoring invalid card background configuration (%s)",
+                            type(error).__name__,
+                        )
+                image = await asyncio.to_thread(
+                    render_market_card, overview, **render_kwargs
+                )
                 if not isinstance(image, bytes) or not image:
                     raise ValueError("Renderer returned no PNG bytes")
             except Exception as e:
@@ -702,6 +734,12 @@ class AStockMarketPlugin(Star):
         groups = self.config.get("scheduled_push_groups", [])
         llm = self.config.get("enable_llm_analysis", False)
         image = self.config.get("enable_image_output", False)
+        backgrounds = self.config.get("card_background", [])
+        background_status = (
+            "自定义背景（使用第一张；异常时回退默认底色）"
+            if isinstance(backgrounds, list) and backgrounds
+            else "默认浅色背景"
+        )
         llm_provider, llm_model = self._resolve_llm_provider_info()
         closed_dates = self.config.get("market_closed_dates", [])
         calendar_status = (
@@ -718,6 +756,7 @@ class AStockMarketPlugin(Star):
             f"休市过滤：{calendar_status}\n"
             f"推送群组：{len(groups)} 个\n"
             f"图片输出配置：{'已开启（失败时尝试文字回退）' if image else '已关闭（文字输出）'}\n"
+            f"卡片背景配置：{background_status}，仅图片模式生效\n"
             f"LLM分析：{'✅ 已开启' if llm else '❌ 已关闭'}\n"
             f"LLM提供商：{llm_provider}\n"
             f"LLM模型：{llm_model}\n"

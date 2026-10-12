@@ -33,13 +33,15 @@ PUSH_GRACE_SECONDS = 60
 # LLM 分析提示词
 # ---------------------------------------------------------------------------
 
-MARKET_ANALYSIS_PROMPT = """请仅根据以下指数行情，输出不超过300字的客观解读。
+MARKET_ANALYSIS_PROMPT = """请仅根据以下指数行情，输出约300字的简洁客观解读。
 
 查询时间（北京时间）：{current_time}
 
 {market_data}
 
-请按“指数表现、指数间差异、数据局限”三个部分输出。
+请使用纯文本，按“指数表现、指数间差异、数据局限”三个标题分段输出。
+每段简洁，优先保证三个部分齐全且句子完整；不要为了控制篇幅省略“数据局限”。
+不要使用 Markdown 加粗标记或表格。
 事实必须能在所给数据中核对；推测必须标明为推测。
 这些数据不含行业板块、资金流向、新闻或全市场股票涨跌家数，请勿编造这些信息，
 也不要将监控指数的涨跌数量解释为股票涨跌家数。
@@ -56,7 +58,7 @@ MARKET_ANALYSIS_PROMPT = """请仅根据以下指数行情，输出不超过300�
     "astrbot_plugin_astock_market",
     "AstrBot",
     "A股大盘数据定时推送插件，支持 LLM 智能分析",
-    "1.0.0",
+    "1.1.0",
     "",
 )
 class AStockMarketPlugin(Star):
@@ -560,8 +562,6 @@ class AStockMarketPlugin(Star):
         try:
             analysis = await asyncio.wait_for(request_analysis(), timeout=LLM_TIMEOUT)
             if analysis:
-                if len(analysis) > 300:
-                    analysis = analysis[:299] + "…"
                 return prefix + "🤖 指数解读\n" + analysis
             logger.warning("LLM returned no usable analysis")
         except Exception as e:

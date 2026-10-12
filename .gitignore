@@ -4,3 +4,5 @@ __pycache__/
 .idea/
 AGENTS.md
 /tests/
+/.codex-remote-attachments/
+/assets/logo-before-*.png

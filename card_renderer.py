@@ -8,8 +8,8 @@ from astrbot.api import logger
 
 from .market_api import BEIJING_TZ, MarketOverview
 
-_UP = (203, 55, 64)
-_DOWN = (24, 135, 95)
+_UP = (230, 24, 47)
+_DOWN = (0, 155, 83)
 _NEUTRAL = (77, 88, 105)
 _INK = (32, 46, 64)
 _MUTED = (98, 113, 130)
@@ -332,8 +332,6 @@ def render_market_card(
                     _INK: (18, 29, 43),
                     _NEUTRAL: (35, 45, 58),
                     _MUTED: (27, 38, 51),
-                    _UP: (141, 16, 35),
-                    _DOWN: (0, 70, 42),
                 }.get(color, color)
             draw.text((text_x, text_y), text, font=font, fill=color, anchor="lt")
 

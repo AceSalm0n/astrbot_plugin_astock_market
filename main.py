@@ -66,7 +66,7 @@ MARKET_ANALYSIS_PROMPT = """请仅根据以下指数行情，输出约300字的�
     "astrbot_plugin_astock_market",
     "AstrBot",
     "A股大盘数据定时推送插件，支持 LLM 智能分析",
-    "1.1.0",
+    "1.2.0",
     "",
 )
 class AStockMarketPlugin(Star):

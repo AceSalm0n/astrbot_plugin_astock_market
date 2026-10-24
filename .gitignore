@@ -3,9 +3,8 @@
 __pycache__/
 .idea/
 AGENTS.md
-/tests/*
-!/tests/test_market_history.py
-!/tests/test_trend_analysis.py
-!/tests/test_trend_integration.py
+/tests/
+/docs/superpowers/
+/.superpowers/
 /.codex-remote-attachments/
 /assets/logo-before-*.png

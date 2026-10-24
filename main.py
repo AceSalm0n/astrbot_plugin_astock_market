@@ -25,8 +25,16 @@ from .market_api import (
     format_market_overview_text,
     reset_market_state,
 )
+from .market_history import HistoryClient
+from .trend_analysis import (
+    TREND_ANALYSIS_PROMPT,
+    build_trend_context,
+    load_trading_calendar,
+    resolve_baseline,
+)
 
 LLM_TIMEOUT = 30
+TREND_LLM_TIMEOUT = 90
 PUSH_GRACE_SECONDS = 60
 
 # ---------------------------------------------------------------------------
@@ -67,6 +75,10 @@ class AStockMarketPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config: AstrBotConfig = config if config is not None else {}
+        self._terminated = False
+        self._history_client = None
+        self._trend_calendar = None
+        self._history_state = "尚未查询"
 
         # 定时推送任务句柄
         self._push_task: asyncio.Task | None = None
@@ -140,14 +152,22 @@ class AStockMarketPlugin(Star):
     # ------------------------------------------------------------------
 
     async def terminate(self):
-        for t in (self._startup_task, self._push_task):
-            if t and not t.done():
-                t.cancel()
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
-        await close_session()
+        self._terminated = True
+        try:
+            for t in (self._startup_task, self._push_task):
+                if t and not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+        finally:
+            try:
+                client = getattr(self, "_history_client", None)
+                if client is not None:
+                    await client.close()
+            finally:
+                await close_session()
         logger.info("A股大盘插件已卸载")
 
     # ------------------------------------------------------------------
@@ -506,22 +526,77 @@ class AStockMarketPlugin(Star):
         """
         market_text = format_market_overview_text(overview, detail=True)
         prefix = market_text + "\n\n" if include_market else ""
+        if getattr(self, "_terminated", False):
+            raise asyncio.CancelledError
         if not overview.indices:
             return prefix + "（暂无有效行情，已跳过分析）"
-        today = datetime.now(BEIJING_TZ).date()
-        if any(
-            idx.quote_time is not None
-            and idx.quote_time.astimezone(BEIJING_TZ).date() < today
-            for idx in overview.indices
-        ):
-            return prefix + "（包含历史行情，已跳过当日分析）"
-        prompt = MARKET_ANALYSIS_PROMPT.format(
-            current_time=overview.fetch_time.strftime("%Y-%m-%d %H:%M"),
-            market_data=market_text,
-        )
+        prompt, analysis_context, is_trend = None, "", False
+        if self.config.get("enable_trend_analysis", False):
+            checked_at = datetime.now(BEIJING_TZ)
+            try:
+                calendar = getattr(self, "_trend_calendar", None)
+                if calendar is None:
+                    calendar = load_trading_calendar(
+                        Path(__file__).parent / "assets" / "trading_calendar.json"
+                    )
+                    self._trend_calendar = calendar
+                baseline = resolve_baseline(checked_at, calendar)
+                if baseline is None:
+                    raise ValueError("Trading calendar does not cover the query baseline")
+                client = getattr(self, "_history_client", None)
+                if client is None:
+                    client = HistoryClient(calendar)
+                    self._history_client = client
+                batch = await client.fetch(baseline)
+                if getattr(self, "_terminated", False):
+                    raise asyncio.CancelledError
+                checked_at = datetime.now(BEIJING_TZ)
+                context = build_trend_context(
+                    batch, checked_at, calendar,
+                    self.config.get("market_closed_dates", []),
+                )
+                self._history_state = (
+                    f"{checked_at:%Y-%m-%d %H:%M:%S}：基准{baseline}，"
+                    f"合格历史{len(context.eligible_codes)}/5只"
+                )
+                if context.eligible_codes:
+                    quality = context.quality_notes
+                    if any(idx.quote_time is None for idx in overview.indices):
+                        quality += "\n快照时间未知，不能视为实时行情或用于确认当前趋势。"
+                    if any(idx.quote_time is not None and idx.quote_time.astimezone(BEIJING_TZ).date() < baseline for idx in overview.indices):
+                        quality += "\n当前快照落后历史基准，不能用于确认当前趋势。"
+                    prompt = TREND_ANALYSIS_PROMPT.format(
+                        current_time=checked_at.strftime("%Y-%m-%d %H:%M"),
+                        baseline=f"{baseline}日收盘", horizon=context.header,
+                        market_data=market_text, trend_data=context.history_text,
+                        quality_notes=quality,
+                    )
+                    analysis_context = context.header + "\n\n"
+                    is_trend = True
+                else:
+                    analysis_context = "（趋势不可用：" + context.quality_notes + "）\n\n"
+                    self._history_state += "，趋势不可用"
+            except Exception as exc:
+                logger.warning("Trend preparation failed: %s", exc)
+                analysis_context = "（趋势不可用：历史数据或交易日历不可用）\n\n"
+                self._history_state = f"{checked_at:%Y-%m-%d %H:%M:%S}：历史数据或交易日历不可用"
+        if prompt is None:
+            today = datetime.now(BEIJING_TZ).date()
+            if any(
+                idx.quote_time is not None
+                and idx.quote_time.astimezone(BEIJING_TZ).date() < today
+                for idx in overview.indices
+            ):
+                return prefix + analysis_context + "（包含历史行情，已跳过当日分析）"
+            prompt = MARKET_ANALYSIS_PROMPT.format(
+                current_time=overview.fetch_time.strftime("%Y-%m-%d %H:%M"),
+                market_data=market_text,
+            )
 
         async def request_analysis() -> str:
             """Resolve the selected provider and request a single interpretation."""
+            if getattr(self, "_terminated", False):
+                raise asyncio.CancelledError
             configured = self.config.get("llm_provider_id", "") or ""
             model_override = self.config.get("llm_model", "") or None
             kwargs = {"model": model_override} if model_override else {}
@@ -542,6 +617,8 @@ class AStockMarketPlugin(Star):
                             provider = get_provider(umo) if umo else get_provider()
                     if provider and callable(generate):
                         provider_id = provider.meta().id
+            if getattr(self, "_terminated", False):
+                raise asyncio.CancelledError
             if provider_id and callable(generate):
                 response = await generate(
                     chat_provider_id=provider_id, prompt=prompt, **kwargs
@@ -560,9 +637,15 @@ class AStockMarketPlugin(Star):
             return completion.strip() if isinstance(completion, str) else ""
 
         try:
-            analysis = await asyncio.wait_for(request_analysis(), timeout=LLM_TIMEOUT)
+            analysis = await asyncio.wait_for(
+                request_analysis(),
+                timeout=TREND_LLM_TIMEOUT if is_trend else LLM_TIMEOUT,
+            )
+            if getattr(self, "_terminated", False):
+                raise asyncio.CancelledError
             if analysis:
-                return prefix + "🤖 指数解读\n" + analysis
+                title = "🤖 趋势解读\n" if is_trend else "🤖 指数解读\n"
+                return prefix + analysis_context + title + analysis
             logger.warning("LLM returned no usable analysis")
         except Exception as e:
             logger.warning(f"LLM analysis unavailable: {e}")
@@ -571,7 +654,7 @@ class AStockMarketPlugin(Star):
             if include_market
             else "（LLM 分析暂不可用）"
         )
-        return prefix + explanation
+        return prefix + analysis_context + explanation
 
     # ------------------------------------------------------------------
     # 命令处理器
@@ -747,6 +830,15 @@ class AStockMarketPlugin(Star):
             if isinstance(closed_dates, list) and closed_dates
             else "仅过滤周末（未配置休市日期）"
         )
+        try:
+            trend_calendar = load_trading_calendar(
+                Path(__file__).parent / "assets" / "trading_calendar.json"
+            )
+            trend_years = "、".join(str(year) for year in sorted(trend_calendar.years))
+        except Exception as exc:
+            logger.warning("Trend calendar unavailable for status: %s", exc)
+            trend_years = "不可用"
+        trend_state = getattr(self, "_history_state", "尚未查询")
 
         text = (
             f"📊 A股大盘插件状态\n"
@@ -758,6 +850,9 @@ class AStockMarketPlugin(Star):
             f"图片输出配置：{'已开启（失败时尝试文字回退）' if image else '已关闭（文字输出）'}\n"
             f"卡片背景配置：{background_status}，仅图片模式生效\n"
             f"LLM分析：{'✅ 已开启' if llm else '❌ 已关闭'}\n"
+            f"3—5交易日趋势：{'已开启' if self.config.get('enable_trend_analysis', False) else '已关闭'}\n"
+            f"趋势日历覆盖：{trend_years}（不改变原推送休市配置）\n"
+            f"最近历史检查：{trend_state}（仅历史记录，不代表当前可用）\n"
             f"LLM提供商：{llm_provider}\n"
             f"LLM模型：{llm_model}\n"
             f"已学习群映射：{len(self._group_umo_map)} 个\n"

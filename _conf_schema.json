@@ -44,6 +44,12 @@
         "type": "bool",
         "default": false
     },
+    "enable_trend_analysis": {
+        "description": "启用3—5交易日趋势分析",
+        "hint": "为大盘分析及启用LLM的推送获取已完成日线，研判基准收盘日之后第3至第5交易日的趋势。默认关闭；历史不足时回退快照解读。日历仅覆盖2025、2026年，非预测准确率保证",
+        "type": "bool",
+        "default": false
+    },
     "llm_provider_id": {
         "description": "LLM 提供商（用于大盘分析）",
         "hint": "点击「选择提供商」从已配置的对话模型列表中挑选（列表中会显示模型名）。留空则自动使用当前会话默认模型",

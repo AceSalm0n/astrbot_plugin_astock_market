@@ -1,16 +1,21 @@
 """Build dated trend context from verified bars without network or LLM calls."""
 
 import json
-import logging
 import math
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from statistics import mean, stdev
 
-from .market_history import BEIJING_TZ, INDEX_CONFIG, HistoryBatch, IndexHistory, TradingCalendar
+from astrbot.api import logger
 
-logger = logging.getLogger(__name__)
+from .market_history import (
+    BEIJING_TZ,
+    INDEX_CONFIG,
+    HistoryBatch,
+    IndexHistory,
+    TradingCalendar,
+)
 
 TREND_ANALYSIS_PROMPT = """你是一名谨慎、客观的A股指数分析助手。仅依据下面的数据，分析基准交易日
 之后第3至第5个交易日的趋势倾向。此任务不要求次日涨跌预测。

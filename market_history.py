@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import logging
 import math
 import re
 from dataclasses import dataclass, replace
@@ -11,7 +10,8 @@ from time import monotonic
 
 import aiohttp
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
+
 BEIJING_TZ = timezone(timedelta(hours=8))
 INDEX_CONFIG = (
     ("000001", "上证指数", "1.000001", "sh000001"),

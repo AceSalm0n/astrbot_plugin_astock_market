@@ -23,6 +23,36 @@
         "type": "list",
         "default": []
     },
+    "enable_index_alerts": {
+        "description": "启用指数异动提醒",
+        "hint": "交易时段每分钟采样，向定时推送目标中已绑定的群会话发送提醒。保存后重载插件",
+        "type": "bool",
+        "default": false
+    },
+    "alert_thresholds_pct": {
+        "description": "异动涨跌幅阈值（%）",
+        "hint": "使用 0.1 至 20 的正数，例如 1、2、3，涨跌两个方向均适用",
+        "type": "list",
+        "default": [1.0, 2.0, 3.0]
+    },
+    "enable_range_breakout_alerts": {
+        "description": "提醒突破前 20 个交易日区间",
+        "hint": "启用异动提醒后生效。使用已完成日线的最高价和最低价",
+        "type": "bool",
+        "default": false
+    },
+    "enable_midday_report": {
+        "description": "启用午间小结推送",
+        "hint": "交易日北京时间 11:35 准备报告，使用已绑定的推送目标群组",
+        "type": "bool",
+        "default": false
+    },
+    "enable_close_report": {
+        "description": "启用收盘复盘推送",
+        "hint": "交易日北京时间 15:20 准备报告，使用已确认日线和已绑定的目标群组",
+        "type": "bool",
+        "default": false
+    },
     "enable_image_output": {
         "description": "行情输出方式",
         "hint": "选择文字或图片，默认文字。适用于大盘、速报、分析和定时推送；图片依赖、字体或绘图失败时回退完整文字",

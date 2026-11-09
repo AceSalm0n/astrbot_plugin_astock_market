@@ -5,14 +5,14 @@ import json
 import math
 import re
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time
 from time import monotonic
 
 import aiohttp
-
 from astrbot.api import logger
 
-BEIJING_TZ = timezone(timedelta(hours=8))
+from .trading_calendar import BEIJING_TZ, TradingCalendar
+
 INDEX_CONFIG = (
     ("000001", "上证指数", "1.000001", "sh000001"),
     ("399001", "深证成指", "0.399001", "sz399001"),
@@ -30,35 +30,6 @@ FAILURE_TTL = 60
 def now_beijing() -> datetime:
     """Return an aware time for source completion checks."""
     return datetime.now(BEIJING_TZ)
-
-
-@dataclass(frozen=True)
-class TradingCalendar:
-    """Store verified annual weekday closures; uncovered years are unknown."""
-
-    years: dict[int, frozenset[date]]
-
-    def session_dates(self, start: date, end: date) -> tuple[date, ...]:
-        """List sessions without treating missing annual data as open days.
-
-        Args:
-            start: Inclusive first date.
-            end: Inclusive last date.
-
-        Returns:
-            Known trading dates in chronological order.
-
-        Raises:
-            ValueError: Any requested year is not verified.
-        """
-        if any(year not in self.years for year in range(start.year, end.year + 1)):
-            raise ValueError("Trading calendar year is not covered")
-        return tuple(
-            current
-            for offset in range(max(0, (end - start).days + 1))
-            if (current := start + timedelta(days=offset)).weekday() < 5
-            and current not in self.years[current.year]
-        )
 
 
 @dataclass(frozen=True)

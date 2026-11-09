@@ -5,11 +5,10 @@ import json
 import math
 import re
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from time import monotonic
 
 import aiohttp
-
 from astrbot.api import logger
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -141,8 +140,10 @@ _session: aiohttp.ClientSession | None = None
 _closed = False
 _closing = False
 _close_task: asyncio.Task | None = None
-_cache: dict[str, tuple[float, IndexData | None]] = {}
-_inflight: dict[str, asyncio.Task] = {}
+QuoteWindow = tuple[time, time]
+QuoteKey = tuple[str, int | None, QuoteWindow | None]
+_cache: dict[QuoteKey, tuple[float, IndexData | None]] = {}
+_inflight: dict[QuoteKey, asyncio.Task] = {}
 
 
 def reset_market_state() -> None:
@@ -358,11 +359,35 @@ async def _fetch_from_sina(code: str) -> IndexData | None:
     return None
 
 
-async def _fetch_sources(code: str, name: str, secid: str) -> IndexData | None:
+def _quote_matches(
+    quote: IndexData,
+    max_age: int | None,
+    window: QuoteWindow | None,
+) -> bool:
+    """Check source timestamp freshness independently of acquisition time."""
+    if max_age is None and window is None:
+        return True
+    stamp = quote.quote_time
+    if stamp is None or stamp.utcoffset() is None:
+        return False
+    stamp = stamp.astimezone(BEIJING_TZ)
+    now = datetime.now(BEIJING_TZ)
+    age = (now - stamp).total_seconds()
+    return (
+        stamp.date() == now.date()
+        and age >= -5
+        and (max_age is None or age <= max_age)
+        and (window is None or window[0] <= stamp.time() <= window[1])
+    )
+
+
+async def _fetch_sources(
+    code: str, name: str, secid: str, max_age: int | None, window: QuoteWindow | None
+) -> IndexData | None:
     """Try each source in priority order and validate the returned index."""
     raw = await _fetch_from_eastmoney(code, secid)
     parsed = _parse_eastmoney(raw) if raw is not None else None
-    if parsed is not None and parsed.code == code:
+    if parsed is not None and parsed.code == code and _quote_matches(parsed, max_age, window):
         return replace(
             parsed, name=parsed.name or name, fetched_at=datetime.now(BEIJING_TZ)
         )
@@ -370,38 +395,45 @@ async def _fetch_sources(code: str, name: str, secid: str) -> IndexData | None:
         logger.debug(f"Eastmoney invalid or mismatched quote [{code}]")
     for fetcher in (_fetch_from_tencent, _fetch_from_sina):
         parsed = await fetcher(code)
-        if parsed is not None and parsed.code == code:
+        if parsed is not None and parsed.code == code and _quote_matches(parsed, max_age, window):
             return parsed
     logger.warning(f"All market sources failed [{code} {name}]")
     return None
 
 
-async def _fetch_worker(code: str, name: str, secid: str) -> IndexData | None:
+async def _fetch_worker(key: QuoteKey, name: str, secid: str) -> IndexData | None:
     """Bound one source chain and cache only its completed result."""
+    code, max_age, window = key
     try:
         try:
             result = await asyncio.wait_for(
-                _fetch_sources(code, name, secid), timeout=18
+                _fetch_sources(code, name, secid, max_age, window), timeout=18
             )
         except Exception as exc:
             logger.warning(f"Market source chain failed [{code}]: {exc}")
             result = None
         if not _closed:
-            _cache[code] = (monotonic() + (10 if result is not None else 3), result)
+            _cache[key] = (monotonic() + (10 if result is not None else 3), result)
         return result
     finally:
-        if _inflight.get(code) is asyncio.current_task():
-            _inflight.pop(code, None)
+        if _inflight.get(key) is asyncio.current_task():
+            _inflight.pop(key, None)
 
 
 async def fetch_single_index(
-    code: str, force_refresh: bool = False
+    code: str,
+    force_refresh: bool = False,
+    *,
+    max_quote_age_seconds: int | None = None,
+    quote_window: QuoteWindow | None = None,
 ) -> IndexData | None:
     """Fetch a configured index, sharing active work across callers.
 
     Args:
         code: Short index code or its Eastmoney secid.
         force_refresh: Skip cache lookup while still sharing active work.
+        max_quote_age_seconds: Require a same-day timestamp no older than this.
+        quote_window: Optional inclusive Beijing source time window.
 
     Returns:
         An independent quote copy, or None when unavailable or shut down.
@@ -414,23 +446,41 @@ async def fetch_single_index(
     if config is None:
         return None
     code, name, secid = config
-    if not force_refresh and code in _cache:
-        expires_at, cached = _cache[code]
-        if monotonic() < expires_at:
+    key = (code, max_quote_age_seconds, quote_window)
+    if not force_refresh and key in _cache:
+        expires_at, cached = _cache[key]
+        if monotonic() < expires_at and (
+            cached is None or _quote_matches(cached, max_quote_age_seconds, quote_window)
+        ):
             return replace(cached, from_cache=True) if cached is not None else None
-        _cache.pop(code, None)
-    task = _inflight.get(code)
+        _cache.pop(key, None)
+    task = _inflight.get(key)
     if task is None:
-        task = asyncio.create_task(_fetch_worker(code, name, secid))
-        _inflight[code] = task
+        task = asyncio.create_task(_fetch_worker(key, name, secid))
+        _inflight[key] = task
     result = await asyncio.shield(task)
-    return replace(result) if result is not None else None
+    if result is not None and _quote_matches(result, max_quote_age_seconds, quote_window):
+        return replace(result)
+    return None
 
 
-async def fetch_market_overview(force_refresh: bool = False) -> MarketOverview:
+async def fetch_market_overview(
+    force_refresh: bool = False,
+    *,
+    max_quote_age_seconds: int | None = None,
+    quote_window: QuoteWindow | None = None,
+) -> MarketOverview:
     """Fetch all five index chains concurrently and retain partial success."""
     results = await asyncio.gather(
-        *(fetch_single_index(code, force_refresh) for code, _, _ in _INDEX_CONFIG)
+        *(
+            fetch_single_index(
+                code,
+                force_refresh,
+                max_quote_age_seconds=max_quote_age_seconds,
+                quote_window=quote_window,
+            )
+            for code, _, _ in _INDEX_CONFIG
+        )
     )
     indices = [result for result in results if result is not None]
     return MarketOverview(

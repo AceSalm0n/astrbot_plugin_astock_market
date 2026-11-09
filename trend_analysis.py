@@ -1,10 +1,8 @@
 """Build dated trend context from verified bars without network or LLM calls."""
 
-import json
 import math
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
-from pathlib import Path
+from datetime import date, datetime, timedelta
 from statistics import mean, stdev
 
 from astrbot.api import logger
@@ -14,8 +12,9 @@ from .market_history import (
     INDEX_CONFIG,
     HistoryBatch,
     IndexHistory,
-    TradingCalendar,
 )
+from .trading_calendar import TradingCalendar, resolve_baseline
+from .trading_calendar import load_trading_calendar as load_trading_calendar
 
 TREND_ANALYSIS_PROMPT = """你是一名谨慎、客观的A股指数分析助手。仅依据下面的数据，分析基准交易日
 之后第3至第5个交易日的趋势倾向。此任务不要求次日涨跌预测。
@@ -75,65 +74,6 @@ class TrendContext:
     eligible_codes: tuple[str, ...]
     overall_allowed: bool
     header: str
-
-
-def load_trading_calendar(path: Path) -> TradingCalendar:
-    """Read only explicit, sourced annual closures; never fill unknown years.
-
-    Args:
-        path: Bundled annual calendar JSON.
-
-    Returns:
-        Validated common Shanghai/Shenzhen calendar.
-
-    Raises:
-        ValueError: Metadata or closure dates are invalid.
-        OSError: The calendar cannot be read.
-    """
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("schema_version") != 1 or not isinstance(data.get("years"), dict):
-        raise ValueError("Invalid trading calendar schema")
-    years = {}
-    for raw_year, annual in data["years"].items():
-        year = int(raw_year)
-        if not annual.get("sources") or not isinstance(annual.get("closed_weekdays"), list):
-            raise ValueError("Missing annual calendar metadata")
-        date.fromisoformat(annual["verified_at"])
-        days = frozenset(date.fromisoformat(value) for value in annual["closed_weekdays"])
-        if any(day.year != year or day.weekday() >= 5 for day in days):
-            raise ValueError("Invalid weekday closure")
-        years[year] = days
-    if not years:
-        raise ValueError("Empty trading calendar")
-    return TradingCalendar(years)
-
-
-def resolve_baseline(now: datetime, calendar: TradingCalendar) -> date | None:
-    """Resolve the required daily baseline with a 15:15 source-update buffer.
-
-    Args:
-        now: Aware query time.
-        calendar: Verified annual dates.
-
-    Returns:
-        Last required completed session, or None if coverage is unknown.
-    """
-    if now.tzinfo is None:
-        return None
-    local = now.astimezone(BEIJING_TZ)
-    current = local.date()
-    if current.year not in calendar.years:
-        return None
-    if local.time() < time(15, 15):
-        current -= timedelta(days=1)
-    for _ in range(370):
-        try:
-            if calendar.session_dates(current, current):
-                return current
-        except ValueError:
-            return None
-        current -= timedelta(days=1)
-    return None
 
 
 def calculate_indicators(history: IndexHistory) -> dict[str, float | None]:

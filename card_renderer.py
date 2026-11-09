@@ -20,7 +20,7 @@ _INDICES = (
     ("000688", "科创50"),
     ("000300", "沪深300"),
 )
-_FONT_CANDIDATES = (
+FONT_CANDIDATES = (
     "C:/Windows/Fonts/msyh.ttc",
     "C:/Windows/Fonts/msyh.ttf",
     "C:/Windows/Fonts/simhei.ttf",
@@ -52,7 +52,7 @@ def render_market_card(
     from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
     fonts = {}
-    for candidate in _FONT_CANDIDATES:
+    for candidate in FONT_CANDIDATES:
         try:
             fonts = {
                 size: ImageFont.truetype(str(Path(candidate)), size)

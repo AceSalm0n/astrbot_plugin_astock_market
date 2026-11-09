@@ -1,7 +1,7 @@
 name: astrbot_plugin_astock_market
 display_name: A股大盘数据
-desc: A股大盘指数实时行情查询插件，支持上证指数、深证成指、创业板指、科创50、沪深300等五大指数的实时数据查询、定时推送及 LLM 智能分析。
-version: 1.2.1
+desc: 查询 A 股五大指数行情，支持异动提醒、午间小结、收盘复盘、日 K 线及 LLM 解读。
+version: 1.3.0
 author: AceSalm0n
 repo: https://github.com/AceSalm0n/astrbot_plugin_astock_market
 homepage: https://github.com/AceSalm0n/astrbot_plugin_astock_market

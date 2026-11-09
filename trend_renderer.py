@@ -4,8 +4,9 @@ import math
 from dataclasses import dataclass
 from datetime import date
 from io import BytesIO
+from pathlib import Path
 
-from .card_renderer import FONT_CANDIDATES
+from .card_renderer import FONT_CANDIDATES, render_card_sections
 from .market_history import DailyBar, HistoryBatch
 from .market_reports import NAMES
 from .trading_calendar import TradingCalendar
@@ -157,8 +158,26 @@ def format_chart_summary(data: TrendChartData) -> str:
     return "\n".join((*lines, *data.notes))
 
 
-def render_trend_chart(data: TrendChartData) -> bytes:
-    """Draw a PNG from validated close values, keeping warmup gaps empty."""
+def render_trend_chart(
+    data: TrendChartData, *, background_path: Path | None = None
+) -> bytes:
+    """Render a standalone chart with the shared glass card when configured."""
+    plot = render_trend_plot(data, transparent=background_path is not None)
+    if background_path is None:
+        return plot
+    return render_card_sections([plot], background_path=background_path)
+
+
+def render_trend_plot(data: TrendChartData, *, transparent: bool = False) -> bytes:
+    """Draw close data as an opaque PNG or a layer for the glass compositor.
+
+    Args:
+        data: Validated chart series and dates.
+        transparent: Leave the area around the plot transparent.
+
+    Returns:
+        PNG bytes with gaps preserved in uninitialized moving averages.
+    """
     from PIL import Image, ImageDraw, ImageFont
 
     for candidate in FONT_CANDIDATES:
@@ -172,7 +191,9 @@ def render_trend_chart(data: TrendChartData) -> bytes:
     else:
         raise RuntimeError("No supported Chinese font is available")
 
-    image = Image.new("RGB", (1200, 900), "#f5f8fc")
+    mode = "RGBA" if transparent else "RGB"
+    backdrop = (0, 0, 0, 0) if transparent else "#f5f8fc"
+    image = Image.new(mode, (1200, 900), backdrop)
     draw = ImageDraw.Draw(image)
     axis = data.series[0].dates
     comparison = data.mode == "comparison"
@@ -206,7 +227,8 @@ def render_trend_chart(data: TrendChartData) -> bytes:
     margin = max((high - low) * 0.09, 0.1)
     low, high = low - margin, high + margin
     left, top, right, bottom = 130, 174, 1130, 625
-    draw.rounded_rectangle((46, 136, 1154, 680), radius=18, fill="white")
+    plot_fill = (255, 255, 255, 85) if transparent else "white"
+    draw.rounded_rectangle((46, 136, 1154, 680), radius=18, fill=plot_fill)
 
     def y_at(point):
         return bottom - (point - low) / (high - low) * (bottom - top)
@@ -290,7 +312,7 @@ def render_trend_chart(data: TrendChartData) -> bytes:
             wrapped.append(line)
     height = max(image.height, 786 + len(wrapped) * 27)
     if height > image.height:
-        extended = Image.new("RGB", (image.width, height), "#f5f8fc")
+        extended = Image.new(mode, (image.width, height), backdrop)
         extended.paste(image, (0, 0))
         image, draw = extended, ImageDraw.Draw(extended)
     for i, line in enumerate(wrapped):

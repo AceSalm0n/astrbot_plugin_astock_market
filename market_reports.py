@@ -88,6 +88,105 @@ def build_close_report(batch: HistoryBatch, now: datetime) -> MarketReport:
     return MarketReport("close", batch.expected_date, now, False, (), accepted, missing)
 
 
+@dataclass(frozen=True)
+class ReportMetric:
+    """Keep directional values separate from neutral price levels."""
+
+    label: str
+    value: str
+    change_pct: float | None = None
+    deviation_pct: float | None = None
+
+    @property
+    def text_value(self) -> str:
+        if self.deviation_pct is None:
+            return self.value
+        return f"{self.value}（偏离{self.deviation_pct:+.2f}%）"
+
+
+@dataclass(frozen=True)
+class ReportIndexRow:
+    """The same display values for the report card and its text fallback."""
+
+    code: str
+    price: float
+    change_pct: float | None
+    metrics: tuple[ReportMetric, ...]
+    provenance: str
+
+
+def report_index_rows(report: MarketReport) -> list[ReportIndexRow]:
+    """Compute each displayed metric from one accepted quote or history."""
+    rows = []
+    if report.kind == "midday":
+        for q in report.quotes:
+            movement = (
+                100 * (q.latest_price / q.open_price - 1) if q.open_price else None
+            )
+            bounds = (
+                "未知"
+                if q.low_price is None or q.high_price is None
+                else f"{q.low_price:.2f}—{q.high_price:.2f}"
+            )
+            stamp = q.quote_time.astimezone(BEIJING_TZ)
+            rows.append(
+                ReportIndexRow(
+                    q.code,
+                    q.latest_price,
+                    q.change_pct,
+                    (
+                        ReportMetric("上午区间", bounds),
+                        ReportMetric(
+                            "较开盘",
+                            "未知" if movement is None else f"{movement:+.2f}%",
+                            change_pct=movement,
+                        ),
+                    ),
+                    f"{stamp:%H:%M:%S} {q.source or '未知'}",
+                )
+            )
+    else:
+        for code, item in report.histories.items():
+            previous, bar = item.bars[-2:]
+            change = 100 * (bar.close / previous.close - 1)
+            amplitude = 100 * (bar.high - bar.low) / previous.close
+            metrics = calculate_indicators(item)
+            averages = tuple(
+                ReportMetric(
+                    f"MA{n}",
+                    f"{metrics[f'ma_{n}']:.2f}",
+                    deviation_pct=metrics[f"deviation_{n}"],
+                )
+                for n in (5, 10, 20)
+            )
+            rows.append(
+                ReportIndexRow(
+                    code,
+                    bar.close,
+                    change,
+                    (
+                        ReportMetric("开", f"{bar.open:.2f}"),
+                        ReportMetric("高", f"{bar.high:.2f}"),
+                        ReportMetric("低", f"{bar.low:.2f}"),
+                        ReportMetric("振幅", f"{amplitude:.2f}%"),
+                        ReportMetric(
+                            "5日",
+                            f"{metrics['return_5']:+.2f}%",
+                            change_pct=metrics["return_5"],
+                        ),
+                        ReportMetric(
+                            "20日",
+                            f"{metrics['return_20']:+.2f}%",
+                            change_pct=metrics["return_20"],
+                        ),
+                        *averages,
+                    ),
+                    item.source,
+                )
+            )
+    return rows
+
+
 def format_report(report: MarketReport) -> str:
     """Format audited market facts, with missing fields labeled explicitly."""
     lines = [f"📊 {REPORT_LABELS[report.kind]}｜{report.trade_date}（北京时间）"]
@@ -96,47 +195,30 @@ def format_report(report: MarketReport) -> str:
     if not report.count:
         lines.append("本次报告数据不可用")
     ranking = []
-    if report.kind == "midday":
-        for q in report.quotes:
-            pct = "未知" if q.change_pct is None else f"{q.change_pct:+.2f}%"
-            movement = (
-                f"{100 * (q.latest_price / q.open_price - 1):+.2f}%"
-                if q.open_price
-                else "未知"
-            )
-            bounds = (
-                "未知"
-                if q.low_price is None or q.high_price is None
-                else f"{q.low_price:.2f}—{q.high_price:.2f}"
-            )
-            stamp = q.quote_time.astimezone(BEIJING_TZ)
+    for row in report_index_rows(report):
+        pct = "未知" if row.change_pct is None else f"{row.change_pct:+.2f}%"
+        parts = [
+            f"{metric.label}{' ' if metric.label.startswith('MA') else ''}{metric.text_value}"
+            for metric in row.metrics
+        ]
+        head = f"{NAMES[row.code]} {row.price:.2f}（{pct}）"
+        if report.kind == "midday":
+            lines.append("｜".join((head, *parts, row.provenance)))
+        else:
+            lines.append("｜".join((head, " ".join(parts[:3]), parts[3])))
             lines.append(
-                f"{NAMES[q.code]} {q.latest_price:.2f}（{pct}）｜上午区间{bounds}｜较开盘{movement}｜{stamp:%H:%M:%S} {q.source}"
-            )
-            if q.change_pct is not None:
-                ranking.append((q.change_pct, NAMES[q.code]))
-        if report.count:
-            overview = MarketOverview(list(report.quotes), report.generated_at)
-            lines.append(
-                f"午间沪深成交额：{overview.total_amount_text}（上证与深证快照合计）"
-            )
-    else:
-        for code, item in report.histories.items():
-            previous, bar = item.bars[-2:]
-            change = 100 * (bar.close / previous.close - 1)
-            amplitude = 100 * (bar.high - bar.low) / previous.close
-            metrics = calculate_indicators(item)
-            ma = " / ".join(
-                f"MA{n} {metrics[f'ma_{n}']:.2f}（偏离{metrics[f'deviation_{n}']:+.2f}%）"
-                for n in (5, 10, 20)
-            )
-            lines.extend(
-                (
-                    f"{NAMES[code]} {bar.close:.2f}（{change:+.2f}%）｜开{bar.open:.2f} 高{bar.high:.2f} 低{bar.low:.2f}｜振幅{amplitude:.2f}%",
-                    f"  5日{metrics['return_5']:+.2f}%／20日{metrics['return_20']:+.2f}%｜{ma}｜{item.source}",
+                "  "
+                + "｜".join(
+                    ("／".join(parts[4:6]), " / ".join(parts[6:]), row.provenance)
                 )
             )
-            ranking.append((change, NAMES[code]))
+        if row.change_pct is not None:
+            ranking.append((row.change_pct, NAMES[row.code]))
+    if report.kind == "midday" and report.count:
+        overview = MarketOverview(list(report.quotes), report.generated_at)
+        lines.append(
+            f"午间沪深成交额：{overview.total_amount_text}（上证与深证快照合计）"
+        )
     if len(ranking) >= 2:
         lines.append(
             "已知指数表现："

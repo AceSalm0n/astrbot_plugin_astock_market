@@ -33,7 +33,7 @@ from .market_api import (
     format_market_overview_text,
     reset_market_state,
 )
-from .market_history import HistoryBatch, HistoryClient
+from .market_history import HistoryClient
 from .market_reports import (
     MIDDAY_WINDOW,
     NAMES,
@@ -47,6 +47,7 @@ from .market_reports import (
     report_to_dict,
 )
 from .notification_state import NotificationState, write_json_atomic
+from .report_renderer import render_alert_card, render_report_card
 from .trading_calendar import TradingCalendar, load_trading_calendar, resolve_baseline
 from .trend_analysis import (
     TREND_ANALYSIS_PROMPT,
@@ -94,7 +95,7 @@ MARKET_ANALYSIS_PROMPT = """请仅根据以下指数行情，输出约300字的�
     "astrbot_plugin_astock_market",
     "AstrBot",
     "A股大盘数据定时推送插件，支持 LLM 智能分析",
-    "1.2.1",
+    "1.3.0",
     "",
 )
 class AStockMarketPlugin(Star):
@@ -431,14 +432,19 @@ class AStockMarketPlugin(Star):
             logger.error(f"Market push preparation failed: {e}")
 
     async def _send_group_text(
-        self, group_id: str, text: str, image: bytes | None = None,
-        *, platform_id: str | None = None, account: str | None = None,
+        self,
+        group_id: str,
+        text: str,
+        image: bytes | None = None,
+        *,
+        platform_id: str | None = None,
+        account: str | None = None,
     ) -> bool:
         """Send a market payload through the existing OneBot clients.
 
         Args:
             group_id: Numeric group ID.
-            text: Market text or an optional interpretation following the image.
+            text: Complete text payload, used after a definite bound image rejection.
             image: In-memory PNG, or None for a text-only payload.
             platform_id: Exact OneBot adapter for a bound notification.
             account: Exact OneBot account for a bound notification.
@@ -450,17 +456,35 @@ class AStockMarketPlugin(Star):
         if image is not None:
             encoded = base64.b64encode(image).decode("ascii")
             message.append({"type": "image", "data": {"file": "base64://" + encoded}})
-        if text:
-            message.append({"type": "text", "data": {"text": text}})
+        text_segment = {"type": "text", "data": {"text": text}}
+        if text and (image is None or platform_id is None):
+            message.append(text_segment)
         if platform_id is not None:
             if account is None or not account.isdigit():
                 return False
             platform = self.context.get_platform_inst(platform_id)
             if platform is None or platform.meta().name != "aiocqhttp":
                 return False
-            await platform.get_client().call_action(
-                "send_group_msg", self_id=account, group_id=int(group_id), message=message
-            )
+            from aiocqhttp.exceptions import ActionFailed
+
+            call = platform.get_client().call_action
+            try:
+                await call(
+                    "send_group_msg",
+                    self_id=account,
+                    group_id=int(group_id),
+                    message=message,
+                )
+            except ActionFailed:
+                if image is None or not text:
+                    raise
+                logger.warning("OneBot rejected market image; using complete text")
+                await call(
+                    "send_group_msg",
+                    self_id=account,
+                    group_id=int(group_id),
+                    message=[text_segment],
+                )
             return True
         platforms = getattr(self.context, "platform_manager", None)
         if not platforms:
@@ -509,8 +533,40 @@ class AStockMarketPlugin(Star):
             chain.message(text)
         return chain
 
+    def _card_background(self) -> Path | None:
+        """Resolve the first upload inside the plugin's background directory."""
+        backgrounds = self.config.get("card_background", [])
+        if not backgrounds:
+            return None
+        try:
+            if not isinstance(backgrounds, list) or not isinstance(backgrounds[0], str):
+                raise ValueError("Background configuration must be a file list")
+            relative = Path(backgrounds[0])
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or relative.parts[:-1] != ("files", "card_background")
+                or relative.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}
+            ):
+                raise ValueError("Invalid uploaded background path")
+            data_root = StarTools.get_data_dir("astrbot_plugin_astock_market").resolve()
+            uploaded = (data_root / relative).resolve()
+            uploaded.relative_to(data_root / "files" / "card_background")
+            return uploaded
+        except Exception as error:
+            logger.warning(
+                "Ignoring invalid card background configuration (%s)",
+                type(error).__name__,
+            )
+            return None
+
     async def _prepare_market_output(
-        self, overview: MarketOverview, umo: str = "", *, analyze: bool = False
+        self,
+        overview: MarketOverview,
+        umo: str = "",
+        *,
+        analyze: bool = False,
+        index_code: str | None = None,
     ) -> tuple[bytes | None, str, str]:
         """Prepare one payload and its full-text fallback for all recipients.
 
@@ -518,43 +574,29 @@ class AStockMarketPlugin(Star):
             overview: Validated market data from the unchanged fetch layer.
             umo: Session origin used for model selection.
             analyze: Whether to request one bounded interpretation.
+            index_code: Restrict the output to one index and its quote fields.
 
         Returns:
             PNG or None, primary text, and complete text for a send fallback.
         """
+        fallback = format_market_overview_text(overview, detail=index_code is None)
+        analysis = (
+            await self._generate_llm_analysis(overview, umo, include_market=False)
+            if analyze
+            else ""
+        )
+        if analysis:
+            fallback += "\n\n" + analysis
         image = None
-        if self.config.get("enable_image_output", False):
+        if self.config.get("enable_image_output", True):
             try:
                 render_kwargs = {}
-                backgrounds = self.config.get("card_background", [])
-                if backgrounds:
-                    try:
-                        if not isinstance(backgrounds, list) or not isinstance(
-                            backgrounds[0], str
-                        ):
-                            raise ValueError(
-                                "Background configuration must be a file list"
-                            )
-                        relative = Path(backgrounds[0])
-                        if (
-                            relative.is_absolute()
-                            or ".." in relative.parts
-                            or relative.parts[:-1] != ("files", "card_background")
-                            or relative.suffix.lower()
-                            not in {".jpg", ".jpeg", ".png", ".webp"}
-                        ):
-                            raise ValueError("Invalid uploaded background path")
-                        data_root = StarTools.get_data_dir(
-                            "astrbot_plugin_astock_market"
-                        ).resolve()
-                        uploaded = (data_root / relative).resolve()
-                        uploaded.relative_to(data_root / "files" / "card_background")
-                        render_kwargs["background_path"] = uploaded
-                    except Exception as error:
-                        logger.warning(
-                            "Ignoring invalid card background configuration (%s)",
-                            type(error).__name__,
-                        )
+                if analysis:
+                    render_kwargs["analysis"] = analysis
+                if index_code is not None:
+                    render_kwargs["index_code"] = index_code
+                if background := self._card_background():
+                    render_kwargs["background_path"] = background
                 image = await asyncio.to_thread(
                     render_market_card, overview, **render_kwargs
                 )
@@ -563,19 +605,35 @@ class AStockMarketPlugin(Star):
             except Exception as e:
                 logger.warning(f"Market card unavailable; using text: {e}")
                 image = None
-        if analyze:
-            text = await self._generate_llm_analysis(
-                overview, umo, include_market=image is None
+        return image, "" if image is not None else fallback, fallback
+
+    def _card_result(self, event: AstrMessageEvent, fallback: str, image: bytes | None):
+        """Build an image-only result or the complete text when unavailable."""
+        if image is not None:
+            try:
+                return event.chain_result(self._make_chain("", image).chain)
+            except Exception as exc:
+                logger.warning(
+                    "Market image result unavailable: %s", type(exc).__name__
+                )
+        return event.plain_result(fallback)
+
+    async def _prepare_notice_image(self, render, *args, **kwargs) -> bytes | None:
+        """Render one report or alert off the event loop under the chart limit."""
+        if not self.config.get("enable_image_output", True):
+            return None
+        try:
+            if background := self._card_background():
+                kwargs["background_path"] = background
+            async with self._chart_limit:
+                image = await asyncio.to_thread(render, *args, **kwargs)
+            if isinstance(image, bytes) and image:
+                return image
+        except Exception as exc:
+            logger.warning(
+                "Market notification image unavailable: %s", type(exc).__name__
             )
-            fallback = (
-                format_market_overview_text(overview) + "\n\n" + text
-                if image is not None
-                else text
-            )
-        else:
-            fallback = format_market_overview_text(overview)
-            text = "" if image is not None else fallback
-        return image, text, fallback
+        return None
 
     # ------------------------------------------------------------------
     # LLM 分析
@@ -820,7 +878,7 @@ class AStockMarketPlugin(Star):
             trade_date: Beijing date of the notification.
             targets: Frozen, already-resolved group session identifiers.
             text: Complete text payload and image fallback.
-            image: Optional in-memory chart.
+            image: Optional complete card.
             counts_as_alert: Whether to charge the daily alert quota.
             deadline: Last allowed time for this notification.
 
@@ -980,11 +1038,15 @@ class AStockMarketPlugin(Star):
                                 second=0,
                                 microsecond=0,
                             )
+                            image = await self._prepare_notice_image(
+                                render_alert_card, events, checked
+                            )
                             await self._submit_notification(
                                 event_id,
                                 checked.date(),
                                 targets,
                                 "\n".join(lines),
+                                image,
                                 counts_as_alert=True,
                                 deadline=min(
                                     session_end, *(event.expires_at for event in events)
@@ -1250,21 +1312,9 @@ class AStockMarketPlugin(Star):
         await self._notifications.mutate(
             lambda data: data["report_jobs"].update({key: job}), now
         )
-        image = None
-        if (
-            kind == "close"
-            and report.histories
-            and self.config.get("enable_image_output", False)
-        ):
-            try:
-                chart = build_chart_data(
-                    HistoryBatch(report.trade_date, report.histories, report.missing),
-                    calendar=self._get_calendar(),
-                )
-                async with self._chart_limit:
-                    image = await asyncio.to_thread(render_trend_chart, chart)
-            except Exception as exc:
-                logger.warning("Close report chart unavailable: %s", type(exc).__name__)
+        image = await self._prepare_notice_image(
+            render_report_card, report, calendar=self._trend_calendar
+        )
         await self._submit_notification(
             "report:" + kind,
             now.date(),
@@ -1303,8 +1353,11 @@ class AStockMarketPlugin(Star):
                 yield event.plain_result("今日休市，无午间报告。")
                 return
             report = await self._get_or_build_report("midday", day)
+            image = await self._prepare_notice_image(
+                render_report_card, report, calendar=self._trend_calendar
+            )
             if not self._terminated:
-                yield event.plain_result(format_report(report))
+                yield self._card_result(event, format_report(report), image)
         except ValueError as exc:
             yield event.plain_result(f"午间小结不可用：{exc}")
         except Exception as exc:
@@ -1321,8 +1374,11 @@ class AStockMarketPlugin(Star):
                 yield event.plain_result("交易日历未覆盖，无法确定收盘基准。")
                 return
             report = await self._get_or_build_report("close", baseline)
+            image = await self._prepare_notice_image(
+                render_report_card, report, calendar=self._trend_calendar
+            )
             if not self._terminated:
-                yield event.plain_result(format_report(report))
+                yield self._card_result(event, format_report(report), image)
         except Exception as exc:
             logger.warning("Close report unavailable: %s", type(exc).__name__)
             yield event.plain_result("收盘复盘暂不可用。")
@@ -1348,8 +1404,11 @@ class AStockMarketPlugin(Star):
             return event.plain_result("走势数据暂不可用。")
         summary = format_chart_summary(data)
         try:
+            background = self._card_background()
             async with self._chart_limit:
-                image = await asyncio.to_thread(render_trend_chart, data)
+                image = await asyncio.to_thread(
+                    render_trend_chart, data, background_path=background
+                )
             return event.chain_result(self._make_chain("", image).chain)
         except Exception as exc:
             logger.warning("Trend chart rendering unavailable: %s", type(exc).__name__)
@@ -1385,7 +1444,8 @@ class AStockMarketPlugin(Star):
         """Fetch and return the market overview without model analysis."""
         self._learn_group_mapping(event)
 
-        yield event.plain_result("正在获取大盘数据...")
+        if not self.config.get("enable_image_output", True):
+            yield event.plain_result("正在获取大盘数据...")
 
         try:
             overview = await fetch_market_overview()
@@ -1393,16 +1453,8 @@ class AStockMarketPlugin(Star):
                 yield event.plain_result("获取大盘数据失败，请稍后重试")
                 return
 
-            image, text, fallback = await self._prepare_market_output(overview)
-            if image is not None:
-                try:
-                    result = event.chain_result(self._make_chain(text, image).chain)
-                except Exception as e:
-                    logger.warning(f"Market image result unavailable; using text: {e}")
-                    result = event.plain_result(fallback)
-            else:
-                result = event.plain_result(text)
-            yield result
+            image, _, fallback = await self._prepare_market_output(overview)
+            yield self._card_result(event, fallback, image)
         except Exception as e:
             logger.error(f"获取大盘数据异常: {e}", exc_info=True)
             yield event.plain_result(f"获取大盘数据失败: {str(e)}")
@@ -1412,7 +1464,8 @@ class AStockMarketPlugin(Star):
         """获取大盘数据 + LLM 分析"""
         self._learn_group_mapping(event)
 
-        yield event.plain_result("正在获取大盘数据并进行分析...")
+        if not self.config.get("enable_image_output", True):
+            yield event.plain_result("正在获取大盘数据并进行分析...")
 
         try:
             overview = await fetch_market_overview()
@@ -1420,18 +1473,10 @@ class AStockMarketPlugin(Star):
                 yield event.plain_result("获取大盘数据失败，请稍后重试")
                 return
 
-            image, text, fallback = await self._prepare_market_output(
+            image, _, fallback = await self._prepare_market_output(
                 overview, event.unified_msg_origin, analyze=True
             )
-            if image is not None:
-                try:
-                    result = event.chain_result(self._make_chain(text, image).chain)
-                except Exception as e:
-                    logger.warning(f"Market image result unavailable; using text: {e}")
-                    result = event.plain_result(fallback)
-            else:
-                result = event.plain_result(text)
-            yield result
+            yield self._card_result(event, fallback, image)
         except Exception as e:
             logger.error(f"大盘分析异常: {e}", exc_info=True)
             yield event.plain_result(f"分析失败: {str(e)}")
@@ -1445,16 +1490,8 @@ class AStockMarketPlugin(Star):
             if not overview.indices:
                 yield event.plain_result("获取大盘数据失败，请稍后重试")
                 return
-            image, text, fallback = await self._prepare_market_output(overview)
-            if image is not None:
-                try:
-                    result = event.chain_result(self._make_chain(text, image).chain)
-                except Exception as e:
-                    logger.warning(f"Market image result unavailable; using text: {e}")
-                    result = event.plain_result(fallback)
-            else:
-                result = event.plain_result(text)
-            yield result
+            image, _, fallback = await self._prepare_market_output(overview)
+            yield self._card_result(event, fallback, image)
         except Exception as e:
             logger.error(f"大盘速报异常: {e}", exc_info=True)
             yield event.plain_result(f"获取失败: {str(e)}")
@@ -1462,68 +1499,41 @@ class AStockMarketPlugin(Star):
     @filter.command("上证")
     async def cmd_shanghai(self, event: AstrMessageEvent):
         """查询上证指数"""
-        result = await self._query_index("000001")
-        if result is None:
-            yield event.plain_result("查询失败，请稍后重试")
-        else:
-            yield event.plain_result(result)
+        yield await self._query_index(event, "000001")
 
     @filter.command("深证")
     async def cmd_shenzhen(self, event: AstrMessageEvent):
         """查询深证成指"""
-        result = await self._query_index("399001")
-        if result is None:
-            yield event.plain_result("查询失败，请稍后重试")
-        else:
-            yield event.plain_result(result)
+        yield await self._query_index(event, "399001")
 
     @filter.command("创业板")
     async def cmd_cyb(self, event: AstrMessageEvent):
         """查询创业板指"""
-        result = await self._query_index("399006")
-        if result is None:
-            yield event.plain_result("查询失败，请稍后重试")
-        else:
-            yield event.plain_result(result)
+        yield await self._query_index(event, "399006")
 
     @filter.command("科创50")
     async def cmd_kc50(self, event: AstrMessageEvent):
         """查询科创50"""
-        result = await self._query_index("000688")
-        if result is None:
-            yield event.plain_result("查询失败，请稍后重试")
-        else:
-            yield event.plain_result(result)
+        yield await self._query_index(event, "000688")
 
     @filter.command("沪深300")
     async def cmd_hs300(self, event: AstrMessageEvent):
         """查询沪深300"""
-        result = await self._query_index("000300")
-        if result is None:
-            yield event.plain_result("查询失败，请稍后重试")
-        else:
-            yield event.plain_result(result)
+        yield await self._query_index(event, "000300")
 
-    async def _query_index(self, code: str) -> str | None:
-        """Return a single index with the shared missing-data formatting.
-
-        Args:
-            code: Supported index code.
-
-        Returns:
-            Formatted index data, or None when every source failed.
-        """
+    async def _query_index(self, event: AstrMessageEvent, code: str):
+        """Return detailed single-index data through the shared output mode."""
         try:
             data = await fetch_single_index(code)
-            if data is None:
-                return None
-            return format_market_overview_text(
-                MarketOverview([data], datetime.now(BEIJING_TZ), data.source),
-                detail=False,
-            )
-        except Exception as e:
-            logger.error(f"Index query failed [{code}]: {e}")
-            return None
+            if data is not None:
+                overview = MarketOverview([data], datetime.now(BEIJING_TZ), data.source)
+                image, _, fallback = await self._prepare_market_output(
+                    overview, index_code=code
+                )
+                return self._card_result(event, fallback, image)
+        except Exception as exc:
+            logger.warning("Index query failed [%s]: %s", code, type(exc).__name__)
+        return event.plain_result("查询失败，请稍后重试")
 
     # ------------------------------------------------------------------
     # 配置查看命令
@@ -1536,7 +1546,7 @@ class AStockMarketPlugin(Star):
         times = self.config.get("scheduled_push_times", "09:30,11:30,15:00")
         groups = self.config.get("scheduled_push_groups", [])
         llm = self.config.get("enable_llm_analysis", False)
-        image = self.config.get("enable_image_output", False)
+        image = self.config.get("enable_image_output", True)
         backgrounds = self.config.get("card_background", [])
         background_status = (
             "自定义背景（使用第一张；异常时回退默认底色）"
@@ -1568,7 +1578,7 @@ class AStockMarketPlugin(Star):
             f"休市过滤：{calendar_status}\n"
             f"推送群组：{len(groups)} 个\n"
             f"图片输出配置：{'已开启（失败时尝试文字回退）' if image else '已关闭（文字输出）'}\n"
-            f"卡片背景配置：{background_status}，仅图片模式生效\n"
+            f"卡片背景配置：{background_status}，仅图片模式生效，走势图片也适用\n"
             f"LLM分析：{'✅ 已开启' if llm else '❌ 已关闭'}\n"
             f"3—5交易日趋势：{'已开启' if self.config.get('enable_trend_analysis', False) else '已关闭'}\n"
             f"趋势日历覆盖：{trend_years}（不改变原推送休市配置）\n"

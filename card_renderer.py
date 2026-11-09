@@ -1,12 +1,13 @@
-"""Render a fixed five-index overview as an in-memory PNG card."""
+"""Render measured market cards with optional uploaded backgrounds."""
 
 import warnings
 from io import BytesIO
 from pathlib import Path
+from typing import TypeAlias
 
 from astrbot.api import logger
 
-from .market_api import BEIJING_TZ, MarketOverview
+from .market_api import BEIJING_TZ, MarketOverview, _fmt_amount, _fmt_number
 
 _UP = (230, 24, 47)
 _DOWN = (0, 155, 83)
@@ -31,9 +32,23 @@ FONT_CANDIDATES = (
     "/System/Library/Fonts/PingFang.ttc",
 )
 
+CardLine: TypeAlias = tuple[str, int, tuple[int, int, int]]
+CardSection: TypeAlias = list[CardLine | list[CardLine]]
+
+
+def change_color(value: float | None) -> tuple[int, int, int]:
+    """Return the A-share color convention for a signed change."""
+    if value is None or round(value, 2) == 0:
+        return _NEUTRAL
+    return _UP if value > 0 else _DOWN
+
 
 def render_market_card(
-    overview: MarketOverview, *, background_path: Path | None = None
+    overview: MarketOverview,
+    *,
+    background_path: Path | None = None,
+    analysis: str = "",
+    index_code: str | None = None,
 ) -> bytes:
     """Render quotes with explicit missing rows and provenance.
 
@@ -41,6 +56,8 @@ def render_market_card(
         overview: Existing market snapshot; its response clock anchors quote age.
         background_path: Validated uploaded image path, or None for the light card.
             Invalid images are ignored without discarding the market card.
+        analysis: Optional complete interpretation to include inside the image.
+        index_code: Select a single-index card with full quote details.
 
     Returns:
         PNG bytes without writing runtime files.
@@ -49,20 +66,6 @@ def render_market_card(
         ImportError: Pillow is unavailable.
         RuntimeError: No supported Chinese font can be loaded.
     """
-    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
-
-    fonts = {}
-    for candidate in FONT_CANDIDATES:
-        try:
-            fonts = {
-                size: ImageFont.truetype(str(Path(candidate)), size)
-                for size in (22, 26, 30, 36, 40)
-            }
-            break
-        except OSError:
-            continue
-    if not fonts:
-        raise RuntimeError("No supported Chinese font is available")
 
     def timestamp(value):
         """Display a source time without inventing an absent timezone.
@@ -102,7 +105,12 @@ def render_market_card(
         return f"{label} {seconds} 秒"
 
     quotes = {quote.code: quote for quote in overview.indices}
-    monitored = [quotes[code] for code, _ in _INDICES if code in quotes]
+    indices = [
+        (code, name)
+        for code, name in _INDICES
+        if index_code is None or index_code == code
+    ]
+    monitored = [quotes[code] for code, _ in indices if code in quotes]
     up = sum(q.change_pct is not None and q.change_pct > 0 for q in monitored)
     down = sum(q.change_pct is not None and q.change_pct < 0 for q in monitored)
     flat = sum(q.change_pct == 0 for q in monitored)
@@ -117,14 +125,14 @@ def render_market_card(
         amount_text = f"{amount / 1e4:.2f}万"
     else:
         amount_text = f"{amount:.2f}元"
-    sections = [
+    sections: list[CardSection | bytes] = [
         [
-            ("A股大盘行情", 40, _INK),
+            ("A股大盘行情" if index_code is None else "指数详细行情", 40, _INK),
             (f"响应：{timestamp(overview.fetch_time)}", 22, _MUTED),
             ("时间口径：北京时间 UTC+8；未带时区的时间单独标注", 22, _MUTED),
         ]
     ]
-    for code, name in _INDICES:
+    for code, name in indices:
         quote = quotes.get(code)
         title = f"{name}  {code}"
         if (
@@ -141,11 +149,7 @@ def render_market_card(
             lines.append(("未获取到行情", 30, _NEUTRAL))
         else:
             pct = quote.change_pct
-            color = (
-                _UP
-                if pct is not None and pct > 0
-                else (_DOWN if pct is not None and pct < 0 else _NEUTRAL)
-            )
+            color = change_color(pct)
             lines.extend(
                 [
                     [
@@ -167,6 +171,23 @@ def render_market_card(
                     (f"采集时间：{timestamp(quote.fetched_at)}", 22, _MUTED),
                 ]
             )
+            lines.extend(
+                [
+                    [
+                        (f"最高  {_fmt_number(quote.high_price)}", 26, _INK),
+                        (f"最低  {_fmt_number(quote.low_price)}", 26, _INK),
+                        (f"昨收  {_fmt_number(quote.pre_close)}", 26, _INK),
+                    ],
+                    [
+                        (
+                            f"涨跌点  {_fmt_number(quote.change, signed=True)}",
+                            26,
+                            change_color(quote.change),
+                        ),
+                        (f"成交额  {_fmt_amount(quote.amount)}", 26, _INK),
+                    ],
+                ]
+            )
         sections.append(lines)
     sources = {q.source for q in monitored}
     quote_times = {timestamp(q.quote_time) for q in monitored}
@@ -186,7 +207,60 @@ def render_market_card(
         footer.append(
             ("提示：部分报价时间或时区未知，无法判断是否为当前行情。", 22, _MUTED)
         )
-    sections.append(footer)
+    if index_code is not None:
+        footer = footer[4:]
+    if footer:
+        sections.append(footer)
+    if analysis:
+        sections.append(
+            [
+                ("行情解读", 36, _INK),
+                *(
+                    (line.removeprefix("🤖 "), 28, _INK)
+                    for line in analysis.splitlines()
+                ),
+            ]
+        )
+    return render_card_sections(sections, background_path=background_path)
+
+
+def render_card_sections(
+    sections: list[CardSection | bytes],
+    *,
+    background_path: Path | None = None,
+) -> bytes:
+    """Draw measured text panels and optional locally generated PNG panels.
+
+    Args:
+        sections: Text panels with grouped rows, or trusted rendered chart PNGs.
+        background_path: Optional validated upload for the shared glass background.
+
+    Returns:
+        One PNG containing the entire payload.
+
+    Raises:
+        ImportError: Pillow is missing.
+        RuntimeError: A suitable Chinese font is unavailable.
+        ValueError: The card exceeds its layout bounds.
+    """
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+
+    sizes = {22}
+    for section in sections:
+        if isinstance(section, bytes):
+            continue
+        for item in section:
+            sizes.update(
+                size for _, size, _ in (item if isinstance(item, list) else [item])
+            )
+    for candidate in FONT_CANDIDATES:
+        try:
+            fonts = {size: ImageFont.truetype(candidate, size) for size in sizes}
+            break
+        except OSError:
+            continue
+    else:
+        raise RuntimeError("No supported Chinese font is available")
 
     background = None
     if background_path is not None:
@@ -223,6 +297,19 @@ def render_market_card(
     y = padding
     for section in sections:
         top = y
+        if isinstance(section, bytes):
+            with Image.open(BytesIO(section)) as source:
+                chart = source.convert("RGBA")
+            panel_width = width - 2 * padding
+            if chart.width != panel_width:
+                chart = chart.resize(
+                    (panel_width, round(chart.height * panel_width / chart.width)),
+                    Image.Resampling.LANCZOS,
+                )
+            y += chart.height
+            layouts.append((top, y, chart))
+            y += gap
+            continue
         y += inset
         runs = []
         for item in section:
@@ -236,9 +323,11 @@ def render_market_card(
                 ]
                 if sum(widths) + 32 * (len(item) - 1) <= text_width:
                     x = padding + inset
+                    step = text_width // len(item)
+                    aligned = max(widths) + 24 <= step
                     for (text, size, color), run_width in zip(item, widths):
                         runs.append((x, y, text, fonts[size], color))
-                        x += run_width + 32
+                        x += step if aligned else run_width + 32
                     y += (
                         max(
                             max(size + 5, fonts[size].getbbox(text, anchor="lt")[3] + 5)
@@ -252,6 +341,9 @@ def render_market_card(
             for text, size, color in item:
                 font = fonts[size]
                 wrapped, line = [], ""
+                if not text:
+                    y += max(8, size // 2)
+                    continue
                 for character in text:
                     trial = line + character
                     bounds = font.getbbox(trial, anchor="lt")
@@ -269,7 +361,10 @@ def render_market_card(
         y += inset - 4
         layouts.append((top, y, runs))
         y += gap
-    image = Image.new("RGB", (width, y + padding - gap + 50), (239, 244, 249))
+    height = y + padding - gap + 50
+    if height > 7200:
+        raise ValueError("Market card exceeds the maximum height")
+    image = Image.new("RGB", (width, height), (239, 244, 249))
     if background is not None:
         background = ImageOps.fit(
             background, image.size, method=Image.Resampling.LANCZOS
@@ -326,6 +421,12 @@ def render_market_card(
                 (0, 0, panel_width - 1, panel_height - 1), radius=24, fill=255
             )
             image.paste(panel, (padding, top), mask)
+        if isinstance(runs, Image.Image):
+            if image.mode == "RGBA":
+                image.alpha_composite(runs, dest=(padding, top))
+            else:
+                image.paste(runs, (padding, top), runs)
+            continue
         for text_x, text_y, text, font, color in runs:
             if background is not None:
                 color = {

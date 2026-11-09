@@ -1,5 +1,4 @@
-# AstrBot A股大盘数据插件
-# 定时获取A股主要指数数据，支持LLM智能分析
+"""A-share market data plugin for AstrBot."""
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 __author__ = "AceSalm0n"

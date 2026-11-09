@@ -9,6 +9,7 @@ from datetime import datetime, time, timedelta, timezone
 from time import monotonic
 
 import aiohttp
+
 from astrbot.api import logger
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -387,7 +388,11 @@ async def _fetch_sources(
     """Try each source in priority order and validate the returned index."""
     raw = await _fetch_from_eastmoney(code, secid)
     parsed = _parse_eastmoney(raw) if raw is not None else None
-    if parsed is not None and parsed.code == code and _quote_matches(parsed, max_age, window):
+    if (
+        parsed is not None
+        and parsed.code == code
+        and _quote_matches(parsed, max_age, window)
+    ):
         return replace(
             parsed, name=parsed.name or name, fetched_at=datetime.now(BEIJING_TZ)
         )
@@ -395,7 +400,11 @@ async def _fetch_sources(
         logger.debug(f"Eastmoney invalid or mismatched quote [{code}]")
     for fetcher in (_fetch_from_tencent, _fetch_from_sina):
         parsed = await fetcher(code)
-        if parsed is not None and parsed.code == code and _quote_matches(parsed, max_age, window):
+        if (
+            parsed is not None
+            and parsed.code == code
+            and _quote_matches(parsed, max_age, window)
+        ):
             return parsed
     logger.warning(f"All market sources failed [{code} {name}]")
     return None
@@ -450,7 +459,8 @@ async def fetch_single_index(
     if not force_refresh and key in _cache:
         expires_at, cached = _cache[key]
         if monotonic() < expires_at and (
-            cached is None or _quote_matches(cached, max_quote_age_seconds, quote_window)
+            cached is None
+            or _quote_matches(cached, max_quote_age_seconds, quote_window)
         ):
             return replace(cached, from_cache=True) if cached is not None else None
         _cache.pop(key, None)
@@ -459,7 +469,9 @@ async def fetch_single_index(
         task = asyncio.create_task(_fetch_worker(key, name, secid))
         _inflight[key] = task
     result = await asyncio.shield(task)
-    if result is not None and _quote_matches(result, max_quote_age_seconds, quote_window):
+    if result is not None and _quote_matches(
+        result, max_quote_age_seconds, quote_window
+    ):
         return replace(result)
     return None
 

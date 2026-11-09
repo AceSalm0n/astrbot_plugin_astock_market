@@ -1,9 +1,4 @@
-"""
-AstrBot A 股大盘数据插件
-定时获取 A 股主要指数数据，支持 LLM 智能分析解读
-
-支持指数：上证指数、深证成指、创业板指、科创50、沪深300
-"""
+"""AstrBot plugin for A-share index quotes, charts, and scheduled reports."""
 
 import asyncio
 import base64
@@ -67,7 +62,7 @@ INDEX_ALIASES = {
 }
 
 # ---------------------------------------------------------------------------
-# LLM 分析提示词
+# LLM analysis prompt
 # ---------------------------------------------------------------------------
 
 MARKET_ANALYSIS_PROMPT = """请仅根据以下指数行情，输出约300字的简洁客观解读。
@@ -87,7 +82,7 @@ MARKET_ANALYSIS_PROMPT = """请仅根据以下指数行情，输出约300字的�
 
 
 # ===========================================================================
-# 插件主类
+# Plugin entry point
 # ===========================================================================
 
 
@@ -95,7 +90,7 @@ MARKET_ANALYSIS_PROMPT = """请仅根据以下指数行情，输出约300字的�
     "astrbot_plugin_astock_market",
     "AstrBot",
     "A股大盘数据定时推送插件，支持 LLM 智能分析",
-    "1.3.0",
+    "1.3.1",
     "",
 )
 class AStockMarketPlugin(Star):
@@ -107,80 +102,97 @@ class AStockMarketPlugin(Star):
         self._terminated = False
         self._history_client = None
         self._trend_calendar = None
+        self._calendar_lock = asyncio.Lock()
         self._history_state = "尚未查询"
 
-        # 定时推送任务句柄
+        # Scheduled push state
         self._push_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
         self._last_push_slot: datetime | None = None
         self._next_push_at: datetime | None = None
-        reset_market_state()
-
-        # 群 unified_msg_origin 映射（动态学习）
+        # Learn group origins from incoming commands.
         self._group_umo_map: dict[str, str] = {}
         self._group_mapping_conflicts: set[str] = set()
         self._group_accounts: dict[str, str] = {}
-        self._load_group_mapping()
-        self._initialize_market_features(self._mapping_path().parent)
+        self._group_mapping_lock = asyncio.Lock()
+        self._group_mapping_dirty = False
+
+    async def initialize(self) -> None:
+        """Restore group mappings before starting scheduled jobs."""
+        reset_market_state()
+        self._data_dir = await asyncio.to_thread(
+            StarTools.get_data_dir, "astrbot_plugin_astock_market"
+        )
+        self._initialize_market_features(self._data_dir)
+        await self._load_group_mapping()
         if self.config.get("enable_index_alerts", False):
             self._alert_task = asyncio.create_task(self._alert_loop())
-        if any(self.config.get(f"enable_{kind}_report", False) for kind in REPORT_TIMES):
+        if any(
+            self.config.get(f"enable_{kind}_report", False) for kind in REPORT_TIMES
+        ):
             self._report_task = asyncio.create_task(self._report_loop())
 
-        # 延迟启动定时推送
         if self.config.get("enable_scheduled_push", False):
             self._startup_task = asyncio.create_task(self._delayed_start_scheduler())
 
-        logger.info("A股大盘插件已加载")
+        logger.info("A-share market plugin loaded")
 
     # ------------------------------------------------------------------
-    # 数据持久化
+    # Group mapping persistence
     # ------------------------------------------------------------------
 
-    def _mapping_path(self) -> Path:
-        return (
-            StarTools.get_data_dir("astrbot_plugin_astock_market")
-            / "group_mapping.json"
-        )
-
-    def _load_group_mapping(self):
-        path = self._mapping_path()
-        if path.exists():
-            try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-                self._group_umo_map = {
-                    key: value for key, value in raw.items() if key.isdigit() and isinstance(value, str)
-                }
-                conflicts = raw.get("_conflicts", [])
-                if isinstance(conflicts, list):
-                    self._group_mapping_conflicts = {value for value in conflicts if isinstance(value, str)}
-                accounts = raw.get("_accounts", {})
-                if isinstance(accounts, dict):
-                    self._group_accounts = {
-                        key: value for key, value in accounts.items()
-                        if key.isdigit() and isinstance(value, str) and value.isdigit()
-                    }
-                logger.info(f"已加载 {len(self._group_umo_map)} 个群组映射")
-            except Exception as e:
-                logger.warning(f"加载群组映射失败: {e}")
-
-    def _save_group_mapping(self):
+    async def _load_group_mapping(self) -> None:
+        path = self._data_dir / "group_mapping.json"
         try:
-            path = self._mapping_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(
-                    {
-                        **self._group_umo_map,
-                        "_conflicts": sorted(self._group_mapping_conflicts),
-                        "_accounts": self._group_accounts,
-                    },
-                    ensure_ascii=False, indent=2,
-                ),
-                encoding="utf-8",
+            raw = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("Group mappings must be a JSON object")
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not load market group mappings: %s", exc)
+            return
+
+        self._group_umo_map = {
+            key: value
+            for key, value in raw.items()
+            if key.isdigit() and isinstance(value, str)
+        }
+        conflicts = raw.get("_conflicts", [])
+        if isinstance(conflicts, list):
+            self._group_mapping_conflicts = {
+                value for value in conflicts if isinstance(value, str)
+            }
+        accounts = raw.get("_accounts", {})
+        if isinstance(accounts, dict):
+            self._group_accounts = {
+                key: value
+                for key, value in accounts.items()
+                if key.isdigit() and isinstance(value, str) and value.isdigit()
+            }
+        logger.info("Loaded %s market group mappings", len(self._group_umo_map))
+
+    async def _save_group_mapping(self) -> None:
+        snapshot = {
+            **self._group_umo_map,
+            "_conflicts": sorted(self._group_mapping_conflicts),
+            "_accounts": self._group_accounts.copy(),
+        }
+        write = asyncio.create_task(
+            asyncio.to_thread(
+                write_json_atomic, self._data_dir / "group_mapping.json", snapshot
             )
-        except Exception as e:
-            logger.warning(f"保存群组映射失败: {e}")
+        )
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            # Keep the lock held until the write stops touching the file.
+            await asyncio.gather(write, return_exceptions=True)
+            raise
+        except OSError as exc:
+            logger.warning("Could not save market group mappings: %s", exc)
+        else:
+            self._group_mapping_dirty = False
 
     def _extract_group_id(self, raw: str) -> str:
         raw = str(raw).strip()
@@ -194,39 +206,57 @@ class AStockMarketPlugin(Star):
             return last
         return raw
 
-    def _learn_group_mapping(self, event: AstrMessageEvent):
-        """Bind only actual group events and mark ambiguous account mappings."""
+    async def _learn_group_mapping(self, event: AstrMessageEvent) -> None:
+        """Bind a group command to the account that received it.
+
+        Args:
+            event: Incoming command with a platform origin and bot account.
+        """
         group_id = str(event.get_group_id())
         umo = event.unified_msg_origin
         account = str(event.get_self_id())
-        if not group_id.isdigit() or not isinstance(umo, str) or ":GroupMessage:" not in umo:
-            return
-        existing = self._group_umo_map.get(group_id)
-        bound = self._group_accounts.get(group_id)
-        if group_id in self._group_mapping_conflicts:
-            return
-        if bound and (
-            (existing and existing.split(":", 1)[0] != umo.split(":", 1)[0])
-            or (account.isdigit() and bound != account)
+        if (
+            not group_id.isdigit()
+            or not isinstance(umo, str)
+            or ":GroupMessage:" not in umo
         ):
-            self._group_mapping_conflicts.add(group_id)
-            self._save_group_mapping()
-        elif existing is None or ":GroupMessage:" not in existing or (not bound and account.isdigit()):
-            self._group_umo_map[group_id] = umo
-            if account.isdigit():
-                self._group_accounts[group_id] = account
-            self._save_group_mapping()
+            return
+        async with self._group_mapping_lock:
+            if self._terminated:
+                return
+            if group_id not in self._group_mapping_conflicts:
+                existing = self._group_umo_map.get(group_id)
+                bound = self._group_accounts.get(group_id)
+                if bound and (
+                    (existing and existing.split(":", 1)[0] != umo.split(":", 1)[0])
+                    or (account.isdigit() and bound != account)
+                ):
+                    self._group_mapping_conflicts.add(group_id)
+                    self._group_mapping_dirty = True
+                elif (
+                    existing is None
+                    or ":GroupMessage:" not in existing
+                    or (not bound and account.isdigit())
+                ):
+                    self._group_umo_map[group_id] = umo
+                    if account.isdigit():
+                        self._group_accounts[group_id] = account
+                    self._group_mapping_dirty = True
+            if self._group_mapping_dirty:
+                await self._save_group_mapping()
 
     # ------------------------------------------------------------------
-    # 生命周期
+    # Lifecycle
     # ------------------------------------------------------------------
 
     async def terminate(self):
         self._terminated = True
         try:
             tasks = (
-                self._startup_task, self._push_task,
-                getattr(self, "_alert_task", None), getattr(self, "_report_task", None),
+                self._startup_task,
+                self._push_task,
+                getattr(self, "_alert_task", None),
+                getattr(self, "_report_task", None),
                 *getattr(self, "_report_workers", {}).values(),
                 *getattr(self, "_report_finalizers", {}).values(),
             )
@@ -238,6 +268,8 @@ class AStockMarketPlugin(Star):
             if lock is not None:
                 async with lock:
                     pass
+            async with self._group_mapping_lock:
+                pass
         finally:
             try:
                 client = getattr(self, "_history_client", None)
@@ -245,10 +277,10 @@ class AStockMarketPlugin(Star):
                     await client.close()
             finally:
                 await close_session()
-        logger.info("A股大盘插件已卸载")
+        logger.info("A-share market plugin unloaded")
 
     # ------------------------------------------------------------------
-    # 定时推送调度
+    # Scheduled pushes
     # ------------------------------------------------------------------
 
     def _parse_push_times(self) -> list[time]:
@@ -301,7 +333,7 @@ class AStockMarketPlugin(Star):
             except asyncio.CancelledError:
                 pass
         self._push_task = asyncio.create_task(self._scheduled_push_loop())
-        logger.info("A股大盘定时推送任务已启动")
+        logger.info("Scheduled market push started")
 
     async def _scheduled_push_loop(self):
         """Keep a pending slot until it is handled, with bounded wake-up checks."""
@@ -533,7 +565,7 @@ class AStockMarketPlugin(Star):
             chain.message(text)
         return chain
 
-    def _card_background(self) -> Path | None:
+    async def _card_background(self) -> Path | None:
         """Resolve the first upload inside the plugin's background directory."""
         backgrounds = self.config.get("card_background", [])
         if not backgrounds:
@@ -549,9 +581,8 @@ class AStockMarketPlugin(Star):
                 or relative.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}
             ):
                 raise ValueError("Invalid uploaded background path")
-            data_root = StarTools.get_data_dir("astrbot_plugin_astock_market").resolve()
-            uploaded = (data_root / relative).resolve()
-            uploaded.relative_to(data_root / "files" / "card_background")
+            uploaded = await asyncio.to_thread((self._data_dir / relative).resolve)
+            uploaded.relative_to(self._data_dir / "files" / "card_background")
             return uploaded
         except Exception as error:
             logger.warning(
@@ -595,7 +626,7 @@ class AStockMarketPlugin(Star):
                     render_kwargs["analysis"] = analysis
                 if index_code is not None:
                     render_kwargs["index_code"] = index_code
-                if background := self._card_background():
+                if background := await self._card_background():
                     render_kwargs["background_path"] = background
                 image = await asyncio.to_thread(
                     render_market_card, overview, **render_kwargs
@@ -623,7 +654,7 @@ class AStockMarketPlugin(Star):
         if not self.config.get("enable_image_output", True):
             return None
         try:
-            if background := self._card_background():
+            if background := await self._card_background():
                 kwargs["background_path"] = background
             async with self._chart_limit:
                 image = await asyncio.to_thread(render, *args, **kwargs)
@@ -636,7 +667,7 @@ class AStockMarketPlugin(Star):
         return None
 
     # ------------------------------------------------------------------
-    # LLM 分析
+    # LLM analysis
     # ------------------------------------------------------------------
 
     def _resolve_llm_provider_info(self) -> tuple[str, str]:
@@ -701,7 +732,6 @@ class AStockMarketPlugin(Star):
         completion = getattr(response, "completion_text", None)
         return completion.strip() if isinstance(completion, str) else ""
 
-
     async def _generate_llm_analysis(
         self, overview: MarketOverview, umo: str = "", *, include_market: bool = True
     ) -> str:
@@ -725,16 +755,21 @@ class AStockMarketPlugin(Star):
         if self.config.get("enable_trend_analysis", False):
             checked_at = datetime.now(BEIJING_TZ)
             try:
-                calendar = self._get_calendar()
+                calendar = await self._get_calendar()
                 baseline = resolve_baseline(checked_at, calendar)
                 if baseline is None:
-                    raise ValueError("Trading calendar does not cover the query baseline")
-                batch = await self._get_history_client().fetch(baseline)
+                    raise ValueError(
+                        "Trading calendar does not cover the query baseline"
+                    )
+                client = await self._get_history_client()
+                batch = await client.fetch(baseline)
                 if getattr(self, "_terminated", False):
                     raise asyncio.CancelledError
                 checked_at = datetime.now(BEIJING_TZ)
                 context = build_trend_context(
-                    batch, checked_at, calendar,
+                    batch,
+                    checked_at,
+                    calendar,
                     self.config.get("market_closed_dates", []),
                 )
                 self._history_state = (
@@ -744,24 +779,36 @@ class AStockMarketPlugin(Star):
                 if context.eligible_codes:
                     quality = context.quality_notes
                     if any(idx.quote_time is None for idx in overview.indices):
-                        quality += "\n快照时间未知，不能视为实时行情或用于确认当前趋势。"
-                    if any(idx.quote_time is not None and idx.quote_time.astimezone(BEIJING_TZ).date() < baseline for idx in overview.indices):
+                        quality += (
+                            "\n快照时间未知，不能视为实时行情或用于确认当前趋势。"
+                        )
+                    if any(
+                        idx.quote_time is not None
+                        and idx.quote_time.astimezone(BEIJING_TZ).date() < baseline
+                        for idx in overview.indices
+                    ):
                         quality += "\n当前快照落后历史基准，不能用于确认当前趋势。"
                     prompt = TREND_ANALYSIS_PROMPT.format(
                         current_time=checked_at.strftime("%Y-%m-%d %H:%M"),
-                        baseline=f"{baseline}日收盘", horizon=context.header,
-                        market_data=market_text, trend_data=context.history_text,
+                        baseline=f"{baseline}日收盘",
+                        horizon=context.header,
+                        market_data=market_text,
+                        trend_data=context.history_text,
                         quality_notes=quality,
                     )
                     analysis_context = context.header + "\n\n"
                     is_trend = True
                 else:
-                    analysis_context = "（趋势不可用：" + context.quality_notes + "）\n\n"
+                    analysis_context = (
+                        "（趋势不可用：" + context.quality_notes + "）\n\n"
+                    )
                     self._history_state += "，趋势不可用"
             except Exception as exc:
                 logger.warning("Trend preparation failed: %s", exc)
                 analysis_context = "（趋势不可用：历史数据或交易日历不可用）\n\n"
-                self._history_state = f"{checked_at:%Y-%m-%d %H:%M:%S}：历史数据或交易日历不可用"
+                self._history_state = (
+                    f"{checked_at:%Y-%m-%d %H:%M:%S}：历史数据或交易日历不可用"
+                )
         if prompt is None:
             today = datetime.now(BEIJING_TZ).date()
             if any(
@@ -796,7 +843,7 @@ class AStockMarketPlugin(Star):
         return prefix + analysis_context + explanation
 
     # ------------------------------------------------------------------
-    # 命令处理器
+    # Alerts, reports, and charts
     # ------------------------------------------------------------------
 
     def _initialize_market_features(self, data_dir: Path) -> None:
@@ -815,24 +862,32 @@ class AStockMarketPlugin(Star):
         self._alert_count = None
         self._last_report = None
 
-    def _get_calendar(self) -> TradingCalendar:
+    async def _get_calendar(self) -> TradingCalendar:
         """Reuse one validated calendar for all historical features."""
         if self._trend_calendar is None:
-            self._trend_calendar = load_trading_calendar(
-                Path(__file__).parent / "assets" / "trading_calendar.json"
-            )
+            async with self._calendar_lock:
+                if self._trend_calendar is None:
+                    self._trend_calendar = await asyncio.to_thread(
+                        load_trading_calendar,
+                        Path(__file__).parent / "assets" / "trading_calendar.json",
+                    )
         return self._trend_calendar
 
-    def _get_history_client(self) -> HistoryClient:
+    async def _get_history_client(self) -> HistoryClient:
         """Reuse one history client across reports, charts and analysis."""
         if self._history_client is None:
-            self._history_client = HistoryClient(self._get_calendar())
+            calendar = await self._get_calendar()
+            if self._terminated:
+                raise asyncio.CancelledError
+            if self._history_client is None:
+                self._history_client = HistoryClient(calendar)
         return self._history_client
 
-    def _is_notification_day(self, day: date) -> bool:
+    async def _is_notification_day(self, day: date) -> bool:
         """Apply the verified calendar plus extra configured closures."""
         closed = self.config.get("market_closed_dates", [])
-        return self._get_calendar().is_session(day) and (
+        calendar = await self._get_calendar()
+        return calendar.is_session(day) and (
             not isinstance(closed, list) or day.isoformat() not in closed
         )
 
@@ -965,7 +1020,7 @@ class AStockMarketPlugin(Star):
                     self.config.get("enable_index_alerts", False)
                     and window
                     and targets
-                    and self._is_notification_day(now.date())
+                    and await self._is_notification_day(now.date())
                 ):
                     await self._notifications.load(now)
                     raw_thresholds = self.config.get(
@@ -987,16 +1042,15 @@ class AStockMarketPlugin(Star):
                     if thresholds or ranges:
                         if ranges and (retry_after is None or now >= retry_after):
                             retry_after = now + timedelta(minutes=15)
-                            baseline = resolve_baseline(now, self._get_calendar())
+                            baseline = resolve_baseline(now, await self._get_calendar())
                             if (
                                 range_history is not None
                                 and range_history.expected_date != baseline
                             ):
                                 range_history = None
                             if baseline is not None and baseline < now.date():
-                                range_history = await self._get_history_client().fetch(
-                                    baseline
-                                )
+                                client = await self._get_history_client()
+                                range_history = await client.fetch(baseline)
                         snapshot = await fetch_market_overview(
                             max_quote_age_seconds=ALERT_AGE,
                             quote_window=window,
@@ -1085,7 +1139,8 @@ class AStockMarketPlugin(Star):
                     max_quote_age_seconds=900, quote_window=MIDDAY_WINDOW
                 )
                 return build_midday_report(quotes, trade_date, datetime.now(BEIJING_TZ))
-            batch = await self._get_history_client().fetch(trade_date)
+            client = await self._get_history_client()
+            batch = await client.fetch(trade_date)
             return build_close_report(batch, datetime.now(BEIJING_TZ))
 
         async with self._report_lock:
@@ -1180,11 +1235,39 @@ class AStockMarketPlugin(Star):
             if worker.done() and self._report_workers.get(key) is worker:
                 self._report_workers.pop(key)
 
-    async def _save_report_archive(self, path: Path, report: MarketReport) -> None:
-        """Wait for an already-started atomic archive write during cancellation."""
-        write = asyncio.create_task(
-            asyncio.to_thread(write_json_atomic, path, report_to_dict(report))
-        )
+    async def _save_report_archive(
+        self, path: Path, report: MarketReport, *, oldest: str | None = None
+    ) -> None:
+        """Save a report atomically and optionally prune expired archives.
+
+        Args:
+            path: Destination of the finalized report.
+            report: Final report to persist.
+            oldest: Earliest retained date in ISO format, set when finalizing.
+        """
+
+        def save_and_prune() -> None:
+            write_json_atomic(path, report_to_dict(report))
+            if oldest is None:
+                return
+            try:
+                for archived in path.parent.glob("*.json"):
+                    if (
+                        re.fullmatch(
+                            r"\d{4}-\d{2}-\d{2}-(midday|close)\.json", archived.name
+                        )
+                        and archived.name[:10] < oldest
+                    ):
+                        try:
+                            archived.unlink(missing_ok=True)
+                        except OSError as exc:
+                            logger.warning(
+                                "Could not remove expired market report: %s", exc
+                            )
+            except OSError as exc:
+                logger.warning("Could not list market report archives: %s", exc)
+
+        write = asyncio.create_task(asyncio.to_thread(save_and_prune))
         try:
             await asyncio.shield(write)
         except asyncio.CancelledError:
@@ -1216,27 +1299,14 @@ class AStockMarketPlugin(Star):
                     )
             if self._terminated:
                 raise asyncio.CancelledError
-            await self._save_report_archive(path, final)
-            self._report_finals[key] = final
             oldest = (datetime.now(BEIJING_TZ).date() - timedelta(days=29)).isoformat()
+            await self._save_report_archive(path, final, oldest=oldest)
+            self._report_finals[key] = final
             self._report_finals = {
                 item: saved
                 for item, saved in self._report_finals.items()
                 if item[1].isoformat() >= oldest
             }
-            for archived in self._reports_dir.glob("*.json"):
-                if (
-                    re.fullmatch(
-                        r"\d{4}-\d{2}-\d{2}-(midday|close)\.json", archived.name
-                    )
-                    and archived.name[:10] < oldest
-                ):
-                    try:
-                        archived.unlink()
-                    except OSError as exc:
-                        logger.warning(
-                            "Market report pruning failed: %s", type(exc).__name__
-                        )
             return final
         finally:
             self._report_finalizers.pop(key, None)
@@ -1245,7 +1315,7 @@ class AStockMarketPlugin(Star):
         """Advance an eligible automatic report by at most one scheduled attempt."""
         if not self.config.get(
             f"enable_{kind}_report", False
-        ) or not self._is_notification_day(now.date()):
+        ) or not await self._is_notification_day(now.date()):
             return
         times, stop = REPORT_TIMES[kind]
         due = [i for i, slot in enumerate(times) if slot <= now.time()]
@@ -1301,7 +1371,7 @@ class AStockMarketPlugin(Star):
                 True,
                 (),
                 {},
-                {code: "数据不可用" for code in NAMES},
+                dict.fromkeys(NAMES, "数据不可用"),
             )
         self._last_report = (
             f"{REPORT_LABELS[kind]} {now.date()} {report.count}/{len(NAMES)}"
@@ -1346,10 +1416,11 @@ class AStockMarketPlugin(Star):
     @filter.command("午间小结")
     async def cmd_midday_report(self, event: AstrMessageEvent):
         """Return today's morning report or the saved cutoff snapshot."""
-        self._learn_group_mapping(event)
+        await self._learn_group_mapping(event)
         try:
             day = datetime.now(BEIJING_TZ).date()
-            if not self._get_calendar().is_session(day):
+            calendar = await self._get_calendar()
+            if not calendar.is_session(day):
                 yield event.plain_result("今日休市，无午间报告。")
                 return
             report = await self._get_or_build_report("midday", day)
@@ -1367,9 +1438,10 @@ class AStockMarketPlugin(Star):
     @filter.command("收盘复盘")
     async def cmd_close_report(self, event: AstrMessageEvent):
         """Return a report for the latest required confirmed close."""
-        self._learn_group_mapping(event)
+        await self._learn_group_mapping(event)
         try:
-            baseline = resolve_baseline(datetime.now(BEIJING_TZ), self._get_calendar())
+            calendar = await self._get_calendar()
+            baseline = resolve_baseline(datetime.now(BEIJING_TZ), calendar)
             if baseline is None:
                 yield event.plain_result("交易日历未覆盖，无法确定收盘基准。")
                 return
@@ -1387,13 +1459,14 @@ class AStockMarketPlugin(Star):
         self, event: AstrMessageEvent, sessions: int, code: str | None
     ):
         """Prepare a chart response and fall back to its equivalent facts."""
-        self._learn_group_mapping(event)
+        await self._learn_group_mapping(event)
         try:
-            calendar = self._get_calendar()
+            calendar = await self._get_calendar()
             baseline = resolve_baseline(datetime.now(BEIJING_TZ), calendar)
             if baseline is None:
                 return event.plain_result("交易日历未覆盖，无法确定收盘基准。")
-            batch = await self._get_history_client().fetch(baseline)
+            client = await self._get_history_client()
+            batch = await client.fetch(baseline)
             data = build_chart_data(
                 batch, sessions=sessions, code=code, calendar=calendar
             )
@@ -1404,7 +1477,7 @@ class AStockMarketPlugin(Star):
             return event.plain_result("走势数据暂不可用。")
         summary = format_chart_summary(data)
         try:
-            background = self._card_background()
+            background = await self._card_background()
             async with self._chart_limit:
                 image = await asyncio.to_thread(
                     render_trend_chart, data, background_path=background
@@ -1442,7 +1515,7 @@ class AStockMarketPlugin(Star):
     @filter.command("大盘")
     async def cmd_market_overview(self, event: AstrMessageEvent):
         """Fetch and return the market overview without model analysis."""
-        self._learn_group_mapping(event)
+        await self._learn_group_mapping(event)
 
         if not self.config.get("enable_image_output", True):
             yield event.plain_result("正在获取大盘数据...")
@@ -1456,13 +1529,13 @@ class AStockMarketPlugin(Star):
             image, _, fallback = await self._prepare_market_output(overview)
             yield self._card_result(event, fallback, image)
         except Exception as e:
-            logger.error(f"获取大盘数据异常: {e}", exc_info=True)
+            logger.exception("Market overview command failed")
             yield event.plain_result(f"获取大盘数据失败: {str(e)}")
 
     @filter.command("大盘分析")
     async def cmd_market_analysis(self, event: AstrMessageEvent):
         """获取大盘数据 + LLM 分析"""
-        self._learn_group_mapping(event)
+        await self._learn_group_mapping(event)
 
         if not self.config.get("enable_image_output", True):
             yield event.plain_result("正在获取大盘数据并进行分析...")
@@ -1478,13 +1551,13 @@ class AStockMarketPlugin(Star):
             )
             yield self._card_result(event, fallback, image)
         except Exception as e:
-            logger.error(f"大盘分析异常: {e}", exc_info=True)
+            logger.exception("Market analysis command failed")
             yield event.plain_result(f"分析失败: {str(e)}")
 
     @filter.command("大盘速报")
     async def cmd_market_quick(self, event: AstrMessageEvent):
         """快速获取大盘数据（不含分析）"""
-        self._learn_group_mapping(event)
+        await self._learn_group_mapping(event)
         try:
             overview = await fetch_market_overview()
             if not overview.indices:
@@ -1493,7 +1566,7 @@ class AStockMarketPlugin(Star):
             image, _, fallback = await self._prepare_market_output(overview)
             yield self._card_result(event, fallback, image)
         except Exception as e:
-            logger.error(f"大盘速报异常: {e}", exc_info=True)
+            logger.exception("Market brief command failed")
             yield event.plain_result(f"获取失败: {str(e)}")
 
     @filter.command("上证")
@@ -1536,7 +1609,7 @@ class AStockMarketPlugin(Star):
         return event.plain_result("查询失败，请稍后重试")
 
     # ------------------------------------------------------------------
-    # 配置查看命令
+    # Configuration and provider commands
     # ------------------------------------------------------------------
 
     @filter.command("大盘状态")
@@ -1561,9 +1634,7 @@ class AStockMarketPlugin(Star):
             else "仅过滤周末（未配置休市日期）"
         )
         try:
-            trend_calendar = load_trading_calendar(
-                Path(__file__).parent / "assets" / "trading_calendar.json"
-            )
+            trend_calendar = await self._get_calendar()
             trend_years = "、".join(str(year) for year in sorted(trend_calendar.years))
         except Exception as exc:
             logger.warning("Trend calendar unavailable for status: %s", exc)
@@ -1599,7 +1670,11 @@ class AStockMarketPlugin(Star):
             except ValueError:
                 thresholds = "阈值配置无效，涨跌幅规则已停用"
             try:
-                active_day = "交易日" if self._is_notification_day(now.date()) else "今日停发"
+                active_day = (
+                    "交易日"
+                    if await self._is_notification_day(now.date())
+                    else "今日停发"
+                )
             except (OSError, ValueError):
                 active_day = "日历不可用或当年未覆盖，新增主动通知暂停"
             ledger = self._notifications.snapshot()
@@ -1619,12 +1694,27 @@ class AStockMarketPlugin(Star):
                 status.append("各目标剩余异动条数：" + "、".join(map(str, remaining)))
             for kind, (slots, _) in REPORT_TIMES.items():
                 enabled_kind = self.config.get(f"enable_{kind}_report", False)
-                when = next((slot.strftime("%H:%M") for slot in slots if slot > now.time()), None)
-                if ledger["report_jobs"].get(f"{now.date()}|{kind}", {}).get("finished"):
+                when = next(
+                    (slot.strftime("%H:%M") for slot in slots if slot > now.time()),
+                    None,
+                )
+                if (
+                    ledger["report_jobs"]
+                    .get(f"{now.date()}|{kind}", {})
+                    .get("finished")
+                ):
                     when = None
-                detail = f"｜今日下一时点 {when}" if enabled_kind and when and active_day == "交易日" else ""
-                status.append(f"{REPORT_LABELS[kind]}：{'开启' if enabled_kind else '关闭'}{detail}")
-            if self._notifications.path.exists() and not self._notifications.available:
+                detail = (
+                    f"｜今日下一时点 {when}"
+                    if enabled_kind and when and active_day == "交易日"
+                    else ""
+                )
+                status.append(
+                    f"{REPORT_LABELS[kind]}：{'开启' if enabled_kind else '关闭'}{detail}"
+                )
+            if not self._notifications.available and await asyncio.to_thread(
+                self._notifications.path.exists
+            ):
                 status.append("通知状态尚未加载或文件异常")
             text += "\n\n" + "\n".join(status)
         yield event.plain_result(text)
@@ -1646,7 +1736,7 @@ class AStockMarketPlugin(Star):
                     model = meta.model or "（未设置）"
                     lines.append(f"• ID: {provider_id}")
                     lines.append(f"  模型: {model}")
-                    # 尝试获取当前 key 状态
+                    # Report whether the provider has a configured key.
                     try:
                         key = p.get_current_key()
                         key_status = "✅" if key else "❌"
@@ -1666,5 +1756,5 @@ class AStockMarketPlugin(Star):
 
             yield event.plain_result("\n".join(lines))
         except Exception as e:
-            logger.error(f"获取提供商列表异常: {e}", exc_info=True)
+            logger.exception("Provider list command failed")
             yield event.plain_result(f"获取失败: {str(e)}")

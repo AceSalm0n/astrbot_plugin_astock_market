@@ -90,7 +90,9 @@ def calculate_indicators(history: IndexHistory) -> dict[str, float | None]:
         ValueError: The sample is too short or prices are nonfinite.
     """
     bars = history.bars
-    if len(bars) < 21 or any(not math.isfinite(bar.close) or bar.close <= 0 for bar in bars):
+    if len(bars) < 21 or any(
+        not math.isfinite(bar.close) or bar.close <= 0 for bar in bars
+    ):
         raise ValueError("Indicators require 21 valid closes")
     result = {}
     for n in (5, 10, 20):
@@ -106,7 +108,9 @@ def calculate_indicators(history: IndexHistory) -> dict[str, float | None]:
     result["range_high"] = max(bar.high for bar in bars[-20:])
     amounts = [bar.amount_yuan for bar in bars[-20:]]
     result["amount_ratio"] = None
-    if history.amount_scope and all(value is not None and math.isfinite(value) and value >= 0 for value in amounts):
+    if history.amount_scope and all(
+        value is not None and math.isfinite(value) and value >= 0 for value in amounts
+    ):
         denominator = mean(amounts)
         if denominator > 0:
             result["amount_ratio"] = mean(amounts[-5:]) / denominator
@@ -114,7 +118,9 @@ def calculate_indicators(history: IndexHistory) -> dict[str, float | None]:
 
 
 def build_trend_context(
-    batch: HistoryBatch, now: datetime, calendar: TradingCalendar,
+    batch: HistoryBatch,
+    now: datetime,
+    calendar: TradingCalendar,
     manual_closed_dates: list[str],
 ) -> TrendContext:
     """Build bounded per-index evidence and fixed trend permissions.
@@ -142,7 +148,10 @@ def build_trend_context(
         targets = None
         notes.append("未来年度日历未覆盖，观察区间仅使用相对交易日T+3至T+5")
     known_target_end = targets[1] if targets else cursor - timedelta(days=1)
-    start = min((item.bars[0].trade_date for item in batch.histories.values() if item.bars), default=baseline)
+    start = min(
+        (item.bars[0].trade_date for item in batch.histories.values() if item.bars),
+        default=baseline,
+    )
     conflict = False
     if not isinstance(manual_closed_dates, list):
         logger.warning("Ignoring malformed manual closure configuration")
@@ -173,9 +182,12 @@ def build_trend_context(
         if conflict:
             continue
         try:
-            if (not item.bars or item.bars[-1].trade_date != baseline
-                    or tuple(bar.trade_date for bar in item.bars)
-                    != calendar.session_dates(item.bars[0].trade_date, baseline)):
+            if (
+                not item.bars
+                or item.bars[-1].trade_date != baseline
+                or tuple(bar.trade_date for bar in item.bars)
+                != calendar.session_dates(item.bars[0].trade_date, baseline)
+            ):
                 raise ValueError("History dates differ from verified sessions")
             metrics = calculate_indicators(item)
         except ValueError:
@@ -185,14 +197,24 @@ def build_trend_context(
             continue
         eligible.append(code)
         age = max(0, int((now - item.fetched_at).total_seconds()))
-        lines = [f"{name}（{code}），{len(item.bars)}日样本，来源：{item.source}，"
-                 f"{'缓存' if item.from_cache else '本次获取'}，采集时间：{item.fetched_at.astimezone(BEIJING_TZ):%Y-%m-%d %H:%M:%S}，年龄{age}秒",
-                 f"完成依据：{item.completion_note}"]
+        lines = [
+            f"{name}（{code}），{len(item.bars)}日样本，来源：{item.source}，"
+            f"{'缓存' if item.from_cache else '本次获取'}，采集时间：{item.fetched_at.astimezone(BEIJING_TZ):%Y-%m-%d %H:%M:%S}，年龄{age}秒",
+            f"完成依据：{item.completion_note}",
+        ]
         for n in (5, 10, 20):
-            lines.append(f"{n}日累计涨幅{metrics[f'return_{n}']:+.2f}%，MA{n}={metrics[f'ma_{n}']:.2f}，收盘偏离{metrics[f'deviation_{n}']:+.2f}%")
-        lines.append(f"20日日收益样本波动{metrics['volatility_20']:.2f}%，20日观察区间{metrics['range_low']:.2f}—{metrics['range_high']:.2f}")
+            lines.append(
+                f"{n}日累计涨幅{metrics[f'return_{n}']:+.2f}%，MA{n}={metrics[f'ma_{n}']:.2f}，收盘偏离{metrics[f'deviation_{n}']:+.2f}%"
+            )
+        lines.append(
+            f"20日日收益样本波动{metrics['volatility_20']:.2f}%，20日观察区间{metrics['range_low']:.2f}—{metrics['range_high']:.2f}"
+        )
         ratio = metrics["amount_ratio"]
-        lines.append(f"5日/20日平均成交额比：{ratio:.2f}" if ratio is not None else "成交额比较未知：缺失金额或统计范围/终值未核实")
+        lines.append(
+            f"5日/20日平均成交额比：{ratio:.2f}"
+            if ratio is not None
+            else "成交额比较未知：缺失金额或统计范围/终值未核实"
+        )
         if len(item.bars) < 60:
             notes.append(f"{name}实际样本{len(item.bars)}日，少于目标60日")
         lines.append("近期10日：日期、收盘、当日涨跌幅")
@@ -204,14 +226,32 @@ def build_trend_context(
     overall = all(code in eligible for code in ("000001", "399001", "000300"))
     if len({batch.histories[code].source for code in eligible}) > 1:
         notes.append("混合来源：各指数使用整段单一来源，不跨源拼接量额")
-    notes.append("允许讨论整体倾向，但不代表预测可信度" if overall else "整体证据不足：上证/深证/沪深300历史未全部合格")
-    horizon = f"T+3至T+5交易日（{targets[0]}至{targets[1]}）" if targets else "T+3至T+5交易日（未来年度日历未知）"
+    notes.append(
+        "允许讨论整体倾向，但不代表预测可信度"
+        if overall
+        else "整体证据不足：上证/深证/沪深300历史未全部合格"
+    )
+    horizon = (
+        f"T+3至T+5交易日（{targets[0]}至{targets[1]}）"
+        if targets
+        else "T+3至T+5交易日（未来年度日历未知）"
+    )
     header = f"趋势基准：{baseline}日收盘\n观察区间：{horizon}\n历史可用：{len(eligible)}/5只指数\n"
     if not overall:
         header += "整体证据不足\n"
     if missing:
         header += "\n".join(missing) + "\n"
     if now.astimezone(BEIJING_TZ).date() > baseline:
-        notes.append("查询已在基准T之后；交易日盘中为T+1观察，日线判断仍基于T收盘，不从查询时刻重新计时")
+        notes.append(
+            "查询已在基准T之后；交易日盘中为T+1观察，日线判断仍基于T收盘，不从查询时刻重新计时"
+        )
     header += "方法说明：LLM定性趋势研判，预测准确率未经验证。"
-    return TrendContext(baseline, targets, "\n\n".join(sections), "\n".join(notes), tuple(eligible), overall, header)
+    return TrendContext(
+        baseline,
+        targets,
+        "\n\n".join(sections),
+        "\n".join(notes),
+        tuple(eligible),
+        overall,
+        header,
+    )

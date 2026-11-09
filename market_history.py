@@ -9,6 +9,7 @@ from datetime import date, datetime, time
 from time import monotonic
 
 import aiohttp
+
 from astrbot.api import logger
 
 from .trading_calendar import BEIJING_TZ, TradingCalendar
@@ -135,21 +136,32 @@ def parse_history(
             if not low <= min(opening, closing) <= max(opening, closing) <= high:
                 raise ValueError("Inconsistent history OHLC")
             bar = DailyBar(
-                day, opening, closing, high, low, _number(row[5]),
+                day,
+                opening,
+                closing,
+                high,
+                low,
+                _number(row[5]),
                 _number(row[6]) if source == "eastmoney" and len(row) > 6 else None,
             )
             if day in unique and unique[day] != bar:
                 raise ValueError("Conflicting duplicate history date")
             unique[day] = bar
-        bars = tuple(unique[day] for day in sorted(unique) if day <= expected_date)[-60:]
+        bars = tuple(unique[day] for day in sorted(unique) if day <= expected_date)[
+            -60:
+        ]
         if len(bars) < 21 or bars[-1].trade_date != expected_date:
             raise ValueError("Missing required day or fewer than 21 closes")
         sessions = calendar.session_dates(bars[0].trade_date, expected_date)
         if tuple(bar.trade_date for bar in bars) != sessions:
             raise ValueError("Missing or unexpected trading date")
         return IndexHistory(
-            code, "东方财富" if source == "eastmoney" else "腾讯财经", bars,
-            now, False, None,
+            code,
+            "东方财富" if source == "eastmoney" else "腾讯财经",
+            bars,
+            now,
+            False,
+            None,
         )
     except (KeyError, TypeError, StopIteration, IndexError, AttributeError) as exc:
         raise ValueError("Malformed history payload") from exc
@@ -178,12 +190,16 @@ def confirm_close(
             parts = match.group(1).split("~")
             if parts[2] != code:
                 return False
-            stamp = datetime.strptime(parts[30], "%Y%m%d%H%M%S").replace(tzinfo=BEIJING_TZ)
+            stamp = datetime.strptime(parts[30], "%Y%m%d%H%M%S").replace(
+                tzinfo=BEIJING_TZ
+            )
             values = (parts[5], parts[3], parts[33], parts[34])
         elif source == "tencent":
             match = re.search(rf'hq_str_{re.escape(symbol)}="([^"\n]+)"', text)
             parts = match.group(1).split(",")
-            stamp = datetime.strptime(parts[30] + " " + parts[31], "%Y-%m-%d %H:%M:%S").replace(tzinfo=BEIJING_TZ)
+            stamp = datetime.strptime(
+                parts[30] + " " + parts[31], "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=BEIJING_TZ)
             values = (parts[1], parts[3], parts[4], parts[5])
         else:
             return False
@@ -194,7 +210,9 @@ def confirm_close(
             and all(
                 (parsed := _number(raw, positive=True)) is not None
                 and abs(parsed - expected) <= 0.011
-                for raw, expected in zip(values, (bar.open, bar.close, bar.high, bar.low))
+                for raw, expected in zip(
+                    values, (bar.open, bar.close, bar.high, bar.low)
+                )
             )
         )
     except (AttributeError, IndexError, TypeError, ValueError):
@@ -234,13 +252,21 @@ class HistoryClient:
         if self._closed:
             raise ValueError("History client is closed")
         if self._session is None:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=SOURCE_TIMEOUT))
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=SOURCE_TIMEOUT)
+            )
         _, _, secid, symbol = next(item for item in INDEX_CONFIG if item[0] == code)
         if source == "eastmoney":
             url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-            params = {"secid": secid, "klt": "101", "fqt": "0", "lmt": "80",
-                      "end": now.strftime("%Y%m%d"), "fields1": "f1,f2,f3,f4,f5,f6",
-                      "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"}
+            params = {
+                "secid": secid,
+                "klt": "101",
+                "fqt": "0",
+                "lmt": "80",
+                "end": now.strftime("%Y%m%d"),
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            }
             proof_url = "https://qt.gtimg.cn/q=" + symbol
         else:
             url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
@@ -249,8 +275,12 @@ class HistoryClient:
 
         async def request(target, query=None):
             async with self._session.get(
-                target, params=query,
-                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+                target,
+                params=query,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://finance.sina.com.cn/",
+                },
             ) as response:
                 response.raise_for_status()
                 return await response.text(encoding="gbk" if query is None else "utf-8")
@@ -267,33 +297,55 @@ class HistoryClient:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*requests, return_exceptions=True)
-        result = parse_history(source, code, json.loads(texts[0]), expected_date, now, self.calendar)
+        result = parse_history(
+            source, code, json.loads(texts[0]), expected_date, now, self.calendar
+        )
         if expected_date == today:
             if not confirm_close(source, code, result.bars[-1], texts[1], now):
                 raise ValueError("Same-day close is unconfirmed")
-            result = replace(result, completion_note="独立盘后报价时间与四价校验通过；成交额终值未核实")
+            result = replace(
+                result,
+                completion_note="独立盘后报价时间与四价校验通过；成交额终值未核实",
+            )
         return result
 
-    async def _worker(self, code: str, expected_date: date) -> tuple[IndexHistory | None, str]:
+    async def _worker(
+        self, code: str, expected_date: date
+    ) -> tuple[IndexHistory | None, str]:
         """Run one fallback chain and cache only the active baseline generation."""
         key = (code, expected_date)
         result, reason = None, "历史行情暂不可用"
         try:
+
             async def sources():
                 nonlocal result, reason
                 for source in ("eastmoney", "tencent"):
                     try:
-                        result = await self._fetch_source(source, code, expected_date, now_beijing())
+                        result = await self._fetch_source(
+                            source, code, expected_date, now_beijing()
+                        )
                         return
-                    except (ValueError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                        logger.warning("History source failed [%s %s]: %s", code, source, exc)
+                    except (
+                        ValueError,
+                        aiohttp.ClientError,
+                        asyncio.TimeoutError,
+                        OSError,
+                    ) as exc:
+                        logger.warning(
+                            "History source failed [%s %s]: %s", code, source, exc
+                        )
                         reason = "日线缺失、未更新、完成状态未确认或历史源不可用"
+
             try:
                 await asyncio.wait_for(sources(), INDEX_TIMEOUT)
             except asyncio.TimeoutError:
                 reason = "历史行情获取超时"
             if not self._closed and expected_date == self._active_date:
-                self._cache[key] = (monotonic() + (SUCCESS_TTL if result else FAILURE_TTL), result, reason)
+                self._cache[key] = (
+                    monotonic() + (SUCCESS_TTL if result else FAILURE_TTL),
+                    result,
+                    reason,
+                )
             return result, reason
         finally:
             self._inflight.pop(key, None)
@@ -308,7 +360,11 @@ class HistoryClient:
             Independent result dictionaries, including explicit failures.
         """
         if self._closed:
-            return HistoryBatch(expected_date, {}, {item[0]: "历史客户端已关闭" for item in INDEX_CONFIG})
+            return HistoryBatch(
+                expected_date,
+                {},
+                {item[0]: "历史客户端已关闭" for item in INDEX_CONFIG},
+            )
         if self._active_date is None or expected_date > self._active_date:
             self._active_date = expected_date
             self._cache.clear()
@@ -319,16 +375,20 @@ class HistoryClient:
             if cached and monotonic() < cached[0]:
                 if cached[1] is not None:
                     item = cached[1]
-                    if (item.bars[-1].trade_date == expected_date
-                            and tuple(bar.trade_date for bar in item.bars)
-                            == self.calendar.session_dates(item.bars[0].trade_date, expected_date)):
+                    if item.bars[-1].trade_date == expected_date and tuple(
+                        bar.trade_date for bar in item.bars
+                    ) == self.calendar.session_dates(
+                        item.bars[0].trade_date, expected_date
+                    ):
                         histories[code] = replace(item, from_cache=True)
                         continue
                 else:
                     unavailable[code] = cached[2]
                     continue
             if key not in self._inflight:
-                self._inflight[key] = asyncio.create_task(self._worker(code, expected_date))
+                self._inflight[key] = asyncio.create_task(
+                    self._worker(code, expected_date)
+                )
             pending[code] = self._inflight[key]
         if pending:
             done, _ = await asyncio.wait(set(pending.values()), timeout=BATCH_TIMEOUT)

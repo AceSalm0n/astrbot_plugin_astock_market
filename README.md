@@ -2,7 +2,7 @@
 
 查询 A 股五大指数行情，查看日 K 线和交易时段复盘，支持指数异动提醒、定时群推送与 LLM 解读。
 
-**版本 1.3.0** · [查看本次更新](CHANGELOG.md#130---2026-11-09)
+**版本 1.3.1** · [查看本次更新](CHANGELOG.md#131---2026-11-09)
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
@@ -123,14 +123,13 @@
 
 ## 🔧 依赖
 
-- `aiohttp`：行情请求，AstrBot 通常已包含。
-- `Pillow`：仅图片模式需要；缺失时在 **AstrBot 实际使用的 Python 环境**安装：
+AstrBot 安装插件时会读取 [requirements.txt](requirements.txt)。`aiohttp` 用于行情请求，`aiocqhttp` 用于 OneBot 推送，`Pillow` 用于生成图片。手动安装时，请在 **AstrBot 实际使用的 Python 环境**执行：
 
 ```shell
-python -m pip install Pillow
+python -m pip install -r requirements.txt
 ```
 
-图片模式还需系统中文字体，如微软雅黑、苹方、Noto Sans CJK 或文泉驿正黑。插件不会自动安装依赖或下载字体；Linux 容器请自行准备中文字体。
+图片模式还需系统中文字体，如微软雅黑、苹方、Noto Sans CJK 或文泉驿正黑。Linux 容器请自行准备中文字体。
 
 ## 更新与参考
 
